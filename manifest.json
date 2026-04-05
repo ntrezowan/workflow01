@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Workflow01",
+  "version": "2.0",
+  "description": "Single-window workspace manager for Firefox. Save, switch, and organize your tabs into workspaces.",
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Open Workflow01 popup"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "workflow01@remakr1.com",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Workflow01",
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  }
+}
