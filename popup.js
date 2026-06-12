@@ -1,5 +1,5 @@
 // ============================================================
-// Workflow01 — Popup UI
+// Workflow01 — Popup UI (v3)
 // ============================================================
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -7,39 +7,35 @@ document.addEventListener("DOMContentLoaded", async () => {
   const nameInput = document.getElementById("workspace-name");
   const currentBanner = document.getElementById("current-banner");
   const currentNameEl = document.getElementById("current-name");
+  const inputHint = document.getElementById("input-hint");
   const confirmOverlay = document.getElementById("confirm-overlay");
   const confirmMessage = document.getElementById("confirm-message");
   const confirmCancel = document.getElementById("confirm-cancel");
   const confirmOk = document.getElementById("confirm-ok");
-  const btnExport = document.getElementById("btn-export");
-  const btnImport = document.getElementById("btn-import");
-  const importFile = document.getElementById("import-file");
 
-  // Get current window
   const currentWindow = await browser.windows.getCurrent();
   const windowId = currentWindow.id;
 
-  // Get current workspace for this window
-  const resp = await browser.runtime.sendMessage({ action: "get_current_workspace", windowId });
-  const currentWorkspace = resp.workspace;
+  const state = await browser.runtime.sendMessage({ action: "get_state", windowId });
+  let currentWorkspace = state.active;
+  let order = state.order || [];
 
-  // ---- Update banner ----
-  if (currentWorkspace) {
-    currentNameEl.textContent = currentWorkspace;
-    currentBanner.classList.remove("unassigned");
-  } else {
-    currentNameEl.textContent = "None";
-    currentBanner.classList.add("unassigned");
+  function refreshBanner() {
+    if (currentWorkspace) {
+      currentNameEl.textContent = currentWorkspace;
+      currentBanner.classList.remove("unassigned");
+    } else {
+      currentNameEl.textContent = "None";
+      currentBanner.classList.add("unassigned");
+    }
   }
+  refreshBanner();
 
-  // ---- Confirm dialog helper ----
-  function showConfirm(message, isDanger = true) {
+  function showConfirm(message, okLabel = "Delete") {
     return new Promise((resolve) => {
       confirmMessage.textContent = message;
-      confirmOk.className = isDanger ? "btn-danger" : "btn-primary";
-      confirmOk.textContent = isDanger ? "Delete" : "Switch";
+      confirmOk.textContent = okLabel;
       confirmOverlay.classList.add("visible");
-
       function cleanup() {
         confirmOverlay.classList.remove("visible");
         confirmCancel.removeEventListener("click", onCancel);
@@ -47,92 +43,112 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       function onCancel() { cleanup(); resolve(false); }
       function onOk() { cleanup(); resolve(true); }
-
       confirmCancel.addEventListener("click", onCancel);
       confirmOk.addEventListener("click", onOk);
     });
   }
 
-  // ---- Render workspace list ----
+  // Fix 6: show a lightweight "Switching..." state instead of the popup
+  // freezing/closing silently while the background materializes discarded tabs.
+  function setBusy(label) {
+    let el = document.getElementById("wf-busy");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "wf-busy";
+      el.style.cssText =
+        "position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:200;" +
+        "display:flex;align-items:center;justify-content:center;font-size:13px;" +
+        "font-weight:600;color:#fff;";
+      document.body.appendChild(el);
+    }
+    el.textContent = label;
+    el.style.display = "flex";
+  }
+
+  // Fix 7: workspace name validation. Returns an error string or null if valid.
+  const MAX_NAME_LEN = 40;
+  function validateName(name) {
+    if (!name) return "Name cannot be empty.";
+    if (name.length > MAX_NAME_LEN) return `Name must be ${MAX_NAME_LEN} characters or fewer.`;
+    // Disallow control chars and names that are only punctuation/symbols.
+    if (/[\u0000-\u001f\u007f]/.test(name)) return "Name contains invalid characters.";
+    if (!/[\p{L}\p{N}]/u.test(name)) return "Name must contain a letter or number.";
+    return null;
+  }
+
+  async function getWorkspaceData() {
+    const data = await browser.storage.local.get(["workspaces", "workspaceOrder"]);
+    const workspaces = data.workspaces || {};
+    let ord = data.workspaceOrder || Object.keys(workspaces);
+    ord = ord.filter((n) => n in workspaces);
+    return { workspaces, order: ord };
+  }
+
   async function renderList() {
     listContainer.innerHTML = "";
-    const data = await browser.storage.local.get("workspaces");
-    const workspaces = data.workspaces || {};
+    const { workspaces, order: ord } = await getWorkspaceData();
+    order = ord;
 
-    const entries = Object.keys(workspaces).sort((a, b) =>
-      a.toLowerCase().localeCompare(b.toLowerCase())
-    );
-
-    if (entries.length === 0) {
-      const emptyMsg = document.createElement("div");
-      emptyMsg.style.cssText = "font-size: 13px; color: #777; padding: 8px 0;";
-      emptyMsg.textContent = "No workspaces yet. Type a name below to create one.";
-      listContainer.appendChild(emptyMsg);
+    if (order.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-msg";
+      empty.textContent = "No workspaces yet. Type a name below to create one.";
+      listContainer.appendChild(empty);
       return;
     }
 
-    entries.forEach((name) => {
+    order.forEach((name) => {
       const urls = workspaces[name] || [];
       const item = document.createElement("div");
       item.className = "workspace-item";
-
-      // Highlight the active workspace
-      if (name === currentWorkspace) {
-        item.classList.add("active");
-      }
-
-      // Info column
-      const info = document.createElement("div");
-      info.className = "workspace-info";
+      if (name === currentWorkspace) item.classList.add("active");
 
       const nameSpan = document.createElement("span");
       nameSpan.className = "workspace-name";
       nameSpan.textContent = name;
-      info.appendChild(nameSpan);
+      nameSpan.title = name;
+      item.appendChild(nameSpan);
 
       const tabCount = document.createElement("span");
       tabCount.className = "workspace-tabs";
-      tabCount.textContent = `${urls.length} tab${urls.length !== 1 ? "s" : ""}`;
-      info.appendChild(tabCount);
+      tabCount.textContent = urls.length;
+      tabCount.title = `${urls.length} tab${urls.length !== 1 ? "s" : ""}`;
+      item.appendChild(tabCount);
 
-      item.appendChild(info);
+      // Rename
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "row-btn rename-btn";
+      renameBtn.textContent = "✎";
+      renameBtn.title = "Rename";
+      renameBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        startRename(item, nameSpan, name);
+      });
+      item.appendChild(renameBtn);
 
-      // Delete button
+      // Delete
       const deleteBtn = document.createElement("button");
-      deleteBtn.className = "delete-btn";
+      deleteBtn.className = "row-btn delete-btn";
       deleteBtn.textContent = "×";
-      deleteBtn.title = "Delete workspace";
-
+      deleteBtn.title = "Delete";
       deleteBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
-        const confirmed = await showConfirm(`Delete workspace "${name}"? This cannot be undone.`, true);
-        if (!confirmed) return;
-
-        const d = await browser.storage.local.get("workspaces");
-        const ws = d.workspaces || {};
-        delete ws[name];
-        await browser.storage.local.set({ workspaces: ws });
-
-        // If we just deleted the active workspace, unassign the window
-        if (name === currentWorkspace) {
-          await browser.runtime.sendMessage({ action: "unassign_workspace", windowId });
+        const ok = await showConfirm(`Delete workspace "${name}"? This closes its tabs and cannot be undone.`, "Delete");
+        if (!ok) return;
+        const resp = await browser.runtime.sendMessage({ action: "delete_workspace", windowId, workspace: name });
+        if (resp.success) {
+          const st = await browser.runtime.sendMessage({ action: "get_state", windowId });
+          currentWorkspace = st.active;
+          refreshBanner();
+          renderList();
         }
-
-        renderList();
       });
-
       item.appendChild(deleteBtn);
 
-      // Click to switch
+      // Switch on row click
       item.addEventListener("click", async () => {
-        if (name === currentWorkspace) return; // Already here
-
-        // Confirm switch if current workspace has tabs
-        if (currentWorkspace) {
-          const ok = await showConfirm(`Switch from "${currentWorkspace}" to "${name}"? Current tabs will be saved.`, false);
-          if (!ok) return;
-        }
-
+        if (name === currentWorkspace) { window.close(); return; }
+        setBusy("Switching\u2026");
         await browser.runtime.sendMessage({ action: "switch_workspace", windowId, workspace: name });
         window.close();
       });
@@ -141,93 +157,108 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
-  // ---- Input handler: create new or switch to existing ----
-  nameInput.addEventListener("keypress", async (e) => {
+  function startRename(item, nameSpan, oldName) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = oldName;
+    input.className = "ws-input";
+    input.style.cssText = "flex-grow:1; padding:2px 6px; font-size:13px;";
+    nameSpan.replaceWith(input);
+    input.focus();
+    input.select();
+
+    async function commit() {
+      const newName = input.value.trim();
+      if (!newName || newName === oldName) { renderList(); return; }
+      const { workspaces } = await getWorkspaceData();
+      if (newName in workspaces) { input.style.borderColor = "#d73a49"; return; }
+      const resp = await browser.runtime.sendMessage({
+        action: "rename_workspace", windowId, oldName, newName
+      });
+      if (resp.success) {
+        if (currentWorkspace === oldName) currentWorkspace = newName;
+        refreshBanner();
+      }
+      renderList();
+    }
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      else if (e.key === "Escape") { renderList(); }
+    });
+    input.addEventListener("blur", commit);
+  }
+
+  nameInput.addEventListener("keydown", async (e) => {
     if (e.key !== "Enter") return;
     const name = nameInput.value.trim();
     if (!name) return;
 
-    const data = await browser.storage.local.get("workspaces");
-    const workspaces = data.workspaces || {};
+    const { workspaces } = await getWorkspaceData();
 
-    if (workspaces[name]) {
-      // Workspace exists — switch to it
-      if (name === currentWorkspace) {
-        window.close();
-        return;
-      }
+    if (name in workspaces) {
+      // Existing -> switch
+      if (name === currentWorkspace) { window.close(); return; }
+      setBusy("Switching\u2026");
       await browser.runtime.sendMessage({ action: "switch_workspace", windowId, workspace: name });
       window.close();
-    } else {
-      // New workspace — get the active tab and migrate it
-      const [activeTab] = await browser.tabs.query({ active: true, windowId });
+      return;
+    }
 
-      if (activeTab && currentWorkspace) {
-        // Migrate active tab to new workspace
-        await browser.runtime.sendMessage({
-          action: "create_workspace_from_tab",
-          windowId,
-          workspace: name,
-          tabId: activeTab.id
-        });
-      } else {
-        // No current workspace (unassigned window) — just assign this window as the new workspace
-        workspaces[name] = [];
-        await browser.storage.local.set({ workspaces });
-        await browser.runtime.sendMessage({ action: "switch_workspace", windowId, workspace: name });
-      }
+    // Fix 7: validate before creating a new workspace.
+    const err = validateName(name);
+    if (err) {
+      inputHint.textContent = err;
+      inputHint.classList.add("input-error");
+      return;
+    }
 
+    setBusy("Creating\u2026");
+    const resp = await browser.runtime.sendMessage({ action: "create_workspace", windowId, workspace: name });
+    if (resp.success) {
       window.close();
+    } else {
+      const el = document.getElementById("wf-busy");
+      if (el) el.style.display = "none";
+      inputHint.textContent = resp.reason === "exists"
+        ? "A workspace with that name already exists."
+        : "Could not create workspace.";
+      inputHint.classList.add("input-error");
     }
   });
 
-  // ---- Export ----
-  btnExport.addEventListener("click", async () => {
-    const data = await browser.storage.local.get("workspaces");
-    const workspaces = data.workspaces || {};
-    const json = JSON.stringify(workspaces, null, 2);
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "workflow01-workspaces.json";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  nameInput.addEventListener("input", () => {
+    inputHint.textContent = "Enter to create new or switch to existing";
+    inputHint.classList.remove("input-error");
   });
 
-  // ---- Import ----
-  btnImport.addEventListener("click", () => {
-    importFile.click();
-  });
-
-  importFile.addEventListener("change", async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    try {
-      const text = await file.text();
-      const imported = JSON.parse(text);
-
-      if (typeof imported !== "object" || Array.isArray(imported)) {
-        alert("Invalid file format. Expected a JSON object of workspaces.");
-        return;
-      }
-
-      // Merge with existing (imported workspaces overwrite same-name ones)
-      const data = await browser.storage.local.get("workspaces");
-      const workspaces = data.workspaces || {};
-      Object.assign(workspaces, imported);
-      await browser.storage.local.set({ workspaces });
-
-      renderList();
-    } catch (err) {
-      alert("Failed to import: " + err.message);
+  // Bonus: arrow-key navigation over the workspace list. Down/Up move a
+  // highlight; Enter switches to the highlighted workspace. Lets you switch
+  // without the mouse. Typing in the name box still takes priority.
+  let highlightIndex = -1;
+  function applyHighlight() {
+    const items = [...listContainer.querySelectorAll(".workspace-item")];
+    items.forEach((el, i) => {
+      el.style.outline = i === highlightIndex ? "2px solid #0060df" : "";
+      el.style.outlineOffset = i === highlightIndex ? "-2px" : "";
+      if (i === highlightIndex) el.scrollIntoView({ block: "nearest" });
+    });
+  }
+  document.addEventListener("keydown", async (e) => {
+    const items = [...listContainer.querySelectorAll(".workspace-item")];
+    if (items.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      highlightIndex = Math.min(highlightIndex + 1, items.length - 1);
+      applyHighlight();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      highlightIndex = Math.max(highlightIndex - 1, 0);
+      applyHighlight();
+    } else if (e.key === "Enter" && highlightIndex >= 0 && document.activeElement !== nameInput) {
+      e.preventDefault();
+      items[highlightIndex].click();
     }
   });
 
-  // ---- Initial render ----
   renderList();
 });

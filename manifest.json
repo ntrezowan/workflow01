@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Workflow01",
-  "version": "2.0",
-  "description": "Single-window workspace manager for Firefox. Save, switch, and organize your tabs into workspaces.",
+  "version": "3.1",
+  "description": "Single-window workspace manager for Firefox. Switch between workspaces instantly without reloading your tabs.",
   "permissions": [
     "tabs",
+    "tabHide",
     "storage"
   ],
   "commands": {
@@ -34,7 +35,19 @@
     "default_icon": {
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
-    }
+    },
+    "theme_icons": [
+      {
+        "light": "icons/icon-night-48.png",
+        "dark": "icons/icon-day-48.png",
+        "size": 48
+      },
+      {
+        "light": "icons/icon-night-128.png",
+        "dark": "icons/icon-day-128.png",
+        "size": 128
+      }
+    ]
   },
   "background": {
     "scripts": ["background.js"]
