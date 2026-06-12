@@ -74,6 +74,8 @@ async function _persistImpl(wsName) {
   for (const id of tabIds) {
     try {
       const t = await browser.tabs.get(id);
+      // Pinned tabs are global — drop ownership and never persist them.
+      if (t.pinned) { tabWorkspace.delete(id); continue; }
       if (isRestorableUrl(t.url)) urls.push(t.url);
     } catch (e) {
       tabWorkspace.delete(id);
@@ -84,6 +86,14 @@ async function _persistImpl(wsName) {
   workspaces[wsName] = urls;
   if (!order.includes(wsName)) order.push(wsName);
   await setWorkspaces(workspaces, order);
+}
+
+// Pinned tabs are GLOBAL: they belong to no workspace, are never hidden, and
+// are never persisted. Firefox cannot hide a pinned tab, so we treat that
+// constraint as intended behavior rather than fighting it.
+async function isPinned(tabId) {
+  try { const t = await browser.tabs.get(tabId); return !!t.pinned; }
+  catch (e) { return false; }
 }
 
 // ---- Badge ----
@@ -143,7 +153,13 @@ async function showWorkspaceTabs(wsName, activate = true) {
 async function hideWorkspaceTabs(wsName) {
   const ids = tabIdsForWorkspace(wsName);
   if (ids.length === 0) return;
-  await browser.tabs.hide(ids).catch(() => {});
+  // Filter out any pinned tabs — Firefox can't hide them and they're global.
+  const hideable = [];
+  for (const id of ids) {
+    try { const t = await browser.tabs.get(id); if (!t.pinned) hideable.push(id); }
+    catch (e) { tabWorkspace.delete(id); }
+  }
+  if (hideable.length) await browser.tabs.hide(hideable).catch(() => {});
 }
 
 // Build real tabs for a workspace from its stored URLs.
@@ -207,9 +223,26 @@ async function switchWorkspace(windowId, targetWorkspace) {
     activeByWindow.set(windowId, targetWorkspace);
     updateBadge(windowId, targetWorkspace);
     await setActiveWorkspace(targetWorkspace);
+
+    // Reconcile: hide any non-pinned visible tab that doesn't belong to the
+    // target. Corrects leaks no matter how they arose (event races, etc.).
+    await reconcileVisibleTabs(windowId, targetWorkspace);
   } finally {
     busyWindows.delete(windowId);
   }
+}
+
+// Hide every visible non-pinned tab in the window that isn't owned by wsName.
+async function reconcileVisibleTabs(windowId, wsName) {
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); }
+  catch (e) { return; }
+  const stray = [];
+  for (const t of tabs) {
+    if (t.hidden || t.pinned) continue;
+    if (tabWorkspace.get(t.id) !== wsName) stray.push(t.id);
+  }
+  if (stray.length) await browser.tabs.hide(stray).catch(() => {});
 }
 
 async function createWorkspace(windowId, newWorkspaceName) {
@@ -228,8 +261,9 @@ async function createWorkspace(windowId, newWorkspaceName) {
     if (!current) {
       // First workspace in an unassigned window — adopt existing tabs.
       const existing = await browser.tabs.query({ windowId });
-      if (existing.length > 0) {
-        for (const t of existing) tabWorkspace.set(t.id, newWorkspaceName);
+      const ownable = existing.filter((t) => !t.pinned); // pinned stay global
+      if (ownable.length > 0) {
+        for (const t of ownable) tabWorkspace.set(t.id, newWorkspaceName);
       } else {
         const fresh = await browser.tabs.create({ windowId, active: true });
         tabWorkspace.set(fresh.id, newWorkspaceName);
@@ -249,6 +283,7 @@ async function createWorkspace(windowId, newWorkspaceName) {
     activeByWindow.set(windowId, newWorkspaceName);
     updateBadge(windowId, newWorkspaceName);
     await setActiveWorkspace(newWorkspaceName);
+    await reconcileVisibleTabs(windowId, newWorkspaceName);
     return { success: true };
   } finally {
     busyWindows.delete(windowId);
@@ -334,10 +369,10 @@ browser.runtime.onMessage.addListener(async (message) => {
 // ---- Tab event listeners ----
 
 browser.tabs.onCreated.addListener((tab) => {
-  // Skip tabs already owned by an internal op.
   if (tabWorkspace.has(tab.id)) return;
   if (pendingTabIds.has(tab.id)) return;
   if (busyWindows.has(tab.windowId)) return;
+  if (tab.pinned) return; // pinned tabs are global — never owned
   const ws = activeByWindow.get(tab.windowId);
   if (ws) {
     tabWorkspace.set(tab.id, ws);
@@ -352,7 +387,25 @@ browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
 });
 
 const _updateTimers = new Map();
-browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // Pin/unpin transition.
+  if (changeInfo.pinned !== undefined) {
+    if (changeInfo.pinned) {
+      // Became pinned -> goes global. Drop from any workspace.
+      const ws = tabWorkspace.get(tabId);
+      tabWorkspace.delete(tabId);
+      if (ws) persistWorkspaceUrls(ws);
+    } else {
+      // Became unpinned -> joins the active workspace of its window.
+      const windowId = tab && tab.windowId;
+      const ws = windowId !== undefined ? activeByWindow.get(windowId) : null;
+      if (ws) {
+        tabWorkspace.set(tabId, ws);
+        persistWorkspaceUrls(ws);
+      }
+    }
+    return;
+  }
   if (changeInfo.status !== "complete" && changeInfo.url === undefined) return;
   const ws = tabWorkspace.get(tabId);
   if (!ws) return;
@@ -398,6 +451,7 @@ async function bootstrap() {
   const restoredUrls = new Set();
 
   for (const t of existingTabs) {
+    if (t.pinned) continue; // pinned tabs are global
     tabWorkspace.set(t.id, target);
     if (isRestorableUrl(t.url)) restoredUrls.add(t.url);
   }

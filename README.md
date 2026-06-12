@@ -18,6 +18,7 @@ Single-window workspace manager for Firefox. Organize your tabs into named works
 - **Theme-aware icon** — split circle that adapts automatically: top-white/bottom-black on light toolbars, top-black/bottom-white on dark toolbars.
 - **Keyboard shortcut** — `Ctrl+Shift+Y` (`Cmd+Shift+Y` on Mac).
 - **Light and dark popup theme** — follows your system preference.
+- **Pinned tabs are global** — a pinned tab stays visible in every workspace (Firefox can't hide pinned tabs, so this is intentional). Unpin it to assign it to the current workspace.
 - **Restart persistence** — last active workspace is restored on Firefox restart. Other workspaces are rebuilt as hidden/unloaded tabs, loaded only when you visit them.
 
 ---
@@ -81,6 +82,11 @@ workflow01/
 ---
 
 ## Version History
+
+### v3.3
+- Fixed: pinned tabs no longer leak as broken duplicates — they are now treated as global (visible in all workspaces by design)
+- Fixed: tab leakage between workspaces — added a reconciliation pass that hides any tab not belonging to the active workspace on every switch
+- Pin/unpin transitions handled correctly (pinning removes a tab from its workspace; unpinning assigns it to the active one)
 
 ### v3.2
 - Fixed: tab duplication bug where switching caused the same tab to appear in multiple workspaces
