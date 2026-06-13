@@ -56,7 +56,8 @@ Single-window workspace manager for Firefox. Organize your tabs into named works
 |---|---|
 | `tabs` | Read and manage tabs for workspace tracking |
 | `tabHide` | Hide/show tabs when switching — without this every switch would reload all tabs |
-| `storage` | Persist workspace data locally on your device |
+| `storage` | Persist the workspace list locally on your device |
+| `sessions` | Tag each tab with its workspace so the assignment survives Firefox restart without recreating tabs |
 
 No data is collected or sent anywhere. Everything stays on your machine.
 
@@ -82,6 +83,12 @@ workflow01/
 ---
 
 ## Version History
+
+### v4.0
+- **Rewrote the persistence layer** to tag tabs via the `sessions` API instead of storing URL lists and recreating tabs on startup. This eliminates the tab-duplication bug (workspaces accumulating dozens of copied tabs across restarts) at the root — tabs are never recreated, so they can never multiply.
+- Tab counts are now computed from actual live tabs, so they never drift from reality
+- Added "Reset all workspaces" link to recover from any corrupted state
+- Requires the `sessions` permission
 
 ### v3.3
 - Fixed: pinned tabs no longer leak as broken duplicates — they are now treated as global (visible in all workspaces by design)

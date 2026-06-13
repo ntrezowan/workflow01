@@ -1,315 +1,207 @@
-// Workflow01 — Background Service (v3.2)
+// Workflow01 — Background Service (v4.0)
 //
-// Model: every tab from every workspace lives in the same window.
-// Active workspace tabs are visible; all others are hidden.
-// Switching = tabs.hide(current) + tabs.show(target). Nothing reloads.
+// MODEL: every tab carries a persistent workspace label written with
+// browser.sessions.setTabValue(). The label rides along with Firefox's own
+// session restore, so we NEVER recreate tabs from URL lists and duplication
+// is impossible. Active workspace's tabs are shown; all others are hidden.
 //
-// Storage (survives restart):
-//   workspaces     -> { name: [url, ...] }
-//   workspaceOrder -> [name, ...]
-//   activeWorkspace -> name | null
+// Pinned tabs are GLOBAL — never labeled, never hidden, shown everywhere.
 //
-// In-memory (current session only):
-//   tabWorkspace   -> Map<tabId, workspaceName>
-//   activeByWindow -> Map<windowId, workspaceName>
+// storage.local:
+//   workspaceOrder  -> [name, ...]      (display order + the canonical list)
+//   activeWorkspace -> name | null      (restored on startup)
+// sessions (per-tab, survives restart):
+//   "workspace" -> name                 (which workspace a tab belongs to)
 
-const tabWorkspace   = new Map();
+const TAB_KEY = "workspace";
+
+// windowId -> active workspace name (in-memory, current session)
 const activeByWindow = new Map();
-
-// Blocks re-entrant structural ops per window.
+// Re-entrancy guard per window for structural ops.
 const busyWindows = new Set();
 
-// Tabs being created by internal ops. Claimed here before tabs.create()
-// returns so the onCreated listener never double-assigns them.
-const pendingTabIds = new Set();
+// ---- storage.local: workspace list + active ----
 
-// ---- Storage ----
-
-async function getWorkspaces() {
-  const data = await browser.storage.local.get(["workspaces", "workspaceOrder"]);
-  const workspaces = data.workspaces || {};
-  let order = data.workspaceOrder || Object.keys(workspaces);
-  order = order.filter((n) => n in workspaces);
-  for (const n of Object.keys(workspaces)) if (!order.includes(n)) order.push(n);
-  return { workspaces, order };
+async function getOrder() {
+  const d = await browser.storage.local.get("workspaceOrder");
+  return Array.isArray(d.workspaceOrder) ? d.workspaceOrder : [];
 }
-
-async function setWorkspaces(workspaces, order) {
-  await browser.storage.local.set({ workspaces, workspaceOrder: order });
+async function setOrder(order) {
+  await browser.storage.local.set({ workspaceOrder: order });
 }
-
+async function addWorkspaceName(name) {
+  const order = await getOrder();
+  if (!order.includes(name)) { order.push(name); await setOrder(order); }
+}
+async function removeWorkspaceName(name) {
+  const order = (await getOrder()).filter((n) => n !== name);
+  await setOrder(order);
+}
 async function setActiveWorkspace(name) {
   await browser.storage.local.set({ activeWorkspace: name });
 }
-
-// Only URLs Firefox can recreate via tabs.create() should ever be persisted.
-function isRestorableUrl(url) {
-  if (!url) return false;
-  return !(
-    url.startsWith("about:") ||
-    url.startsWith("moz-extension://") ||
-    url.startsWith("chrome:") ||
-    url.startsWith("resource:") ||
-    url.startsWith("view-source:") ||
-    url.startsWith("javascript:") ||
-    url.startsWith("data:")
-  );
+async function getActiveWorkspace() {
+  const d = await browser.storage.local.get("activeWorkspace");
+  return d.activeWorkspace || null;
 }
 
-// Serialized per-workspace persist queue — prevents concurrent storage
-// read/write races. Queue entries clean themselves up when settled.
-const persistQueue = new Map();
-function persistWorkspaceUrls(wsName) {
-  const prev = persistQueue.get(wsName) || Promise.resolve();
-  const next = prev.then(() => _persistImpl(wsName)).catch(() => {});
-  persistQueue.set(wsName, next);
-  next.finally(() => { if (persistQueue.get(wsName) === next) persistQueue.delete(wsName); });
-  return next;
+// ---- per-tab label (sessions API) ----
+
+async function getTabWorkspace(tabId) {
+  try { return (await browser.sessions.getTabValue(tabId, TAB_KEY)) || null; }
+  catch (e) { return null; }
+}
+async function setTabWorkspace(tabId, name) {
+  try { await browser.sessions.setTabValue(tabId, TAB_KEY, name); } catch (e) {}
+}
+async function clearTabWorkspace(tabId) {
+  try { await browser.sessions.removeTabValue(tabId, TAB_KEY); } catch (e) {}
 }
 
-async function _persistImpl(wsName) {
-  const tabIds = [];
-  for (const [tabId, ws] of tabWorkspace) if (ws === wsName) tabIds.push(tabId);
-  const urls = [];
-  for (const id of tabIds) {
-    try {
-      const t = await browser.tabs.get(id);
-      // Pinned tabs are global — drop ownership and never persist them.
-      if (t.pinned) { tabWorkspace.delete(id); continue; }
-      if (isRestorableUrl(t.url)) urls.push(t.url);
-    } catch (e) {
-      tabWorkspace.delete(id);
-    }
+// All non-pinned tabs in a window belonging to wsName.
+async function tabsForWorkspace(windowId, wsName) {
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); }
+  catch (e) { return []; }
+  const out = [];
+  for (const t of tabs) {
+    if (t.pinned) continue;
+    if ((await getTabWorkspace(t.id)) === wsName) out.push(t);
   }
-  const { workspaces, order } = await getWorkspaces();
-  if (!(wsName in workspaces) && urls.length === 0) return;
-  workspaces[wsName] = urls;
-  if (!order.includes(wsName)) order.push(wsName);
-  await setWorkspaces(workspaces, order);
+  return out;
 }
 
-// Pinned tabs are GLOBAL: they belong to no workspace, are never hidden, and
-// are never persisted. Firefox cannot hide a pinned tab, so we treat that
-// constraint as intended behavior rather than fighting it.
-async function isPinned(tabId) {
-  try { const t = await browser.tabs.get(tabId); return !!t.pinned; }
-  catch (e) { return false; }
-}
+// ---- badge ----
 
-// ---- Badge ----
-
-function updateBadge(windowId, workspaceName) {
-  if (workspaceName) {
-    browser.action.setBadgeText({ text: workspaceName.substring(0, 3).toUpperCase(), windowId });
+function updateBadge(windowId, name) {
+  if (name) {
+    browser.action.setBadgeText({ text: name.substring(0, 3).toUpperCase(), windowId });
     browser.action.setBadgeBackgroundColor({ color: "#0060df", windowId });
-    if (browser.action.setBadgeTextColor) {
-      browser.action.setBadgeTextColor({ color: "#ffffff", windowId });
-    }
+    if (browser.action.setBadgeTextColor) browser.action.setBadgeTextColor({ color: "#ffffff", windowId });
   } else {
     browser.action.setBadgeText({ text: "", windowId });
   }
 }
 
-// ---- Tab helpers ----
+// ---- show / hide ----
 
-function tabIdsForWorkspace(wsName) {
-  const ids = [];
-  for (const [tabId, ws] of tabWorkspace) if (ws === wsName) ids.push(tabId);
-  return ids;
-}
-
-async function liveTabIdsForWorkspace(wsName) {
-  const ids = tabIdsForWorkspace(wsName);
-  const alive = [];
-  for (const id of ids) {
-    try { await browser.tabs.get(id); alive.push(id); }
-    catch (e) { tabWorkspace.delete(id); }
-  }
-  return alive;
-}
-
-async function ensureWorkspaceHasTab(windowId, wsName, active) {
-  const alive = await liveTabIdsForWorkspace(wsName);
-  if (alive.length > 0) return alive[0];
-  const t = await browser.tabs.create({ windowId, active });
-  tabWorkspace.set(t.id, wsName);
-  await persistWorkspaceUrls(wsName);
-  return t.id;
-}
-
-async function showWorkspaceTabs(wsName, activate = true) {
-  const ids = tabIdsForWorkspace(wsName);
-  if (ids.length === 0) return null;
+async function showWorkspace(windowId, wsName) {
+  const tabs = await tabsForWorkspace(windowId, wsName);
+  if (tabs.length === 0) return null;
+  const ids = tabs.map((t) => t.id);
   await browser.tabs.show(ids).catch(() => {});
-  if (activate) {
-    for (const id of ids) {
-      try { await browser.tabs.update(id, { active: true }); return id; }
-      catch (e) { tabWorkspace.delete(id); }
-    }
+  // activate the first one
+  for (const id of ids) {
+    try { await browser.tabs.update(id, { active: true }); return id; }
+    catch (e) {}
   }
   return ids[0];
 }
 
-async function hideWorkspaceTabs(wsName) {
-  const ids = tabIdsForWorkspace(wsName);
-  if (ids.length === 0) return;
-  // Filter out any pinned tabs — Firefox can't hide them and they're global.
-  const hideable = [];
-  for (const id of ids) {
-    try { const t = await browser.tabs.get(id); if (!t.pinned) hideable.push(id); }
-    catch (e) { tabWorkspace.delete(id); }
-  }
-  if (hideable.length) await browser.tabs.hide(hideable).catch(() => {});
+async function hideWorkspace(windowId, wsName) {
+  const tabs = await tabsForWorkspace(windowId, wsName);
+  const ids = tabs.filter((t) => !t.pinned).map((t) => t.id);
+  if (ids.length) await browser.tabs.hide(ids).catch(() => {});
 }
 
-// Build real tabs for a workspace from its stored URLs.
-// hidden=true creates them discarded (unloaded) — they load only when visited.
-async function materializeWorkspace(windowId, wsName, { hidden }) {
-  const { workspaces } = await getWorkspaces();
-  const urls = (workspaces[wsName] || []).filter(isRestorableUrl);
-
-  if (urls.length === 0) {
-    const t = await browser.tabs.create({ windowId, active: !hidden });
-    tabWorkspace.set(t.id, wsName);
-    if (hidden) await browser.tabs.hide(t.id).catch(() => {});
-    return;
-  }
-
-  const created = [];
-  for (let i = 0; i < urls.length; i++) {
-    let t = null;
-    try {
-      t = await browser.tabs.create({
-        windowId, url: urls[i],
-        active: !hidden && i === 0,
-        discarded: hidden,
-        title: hidden ? urls[i] : undefined
-      });
-    } catch (e) {
-      try {
-        t = await browser.tabs.create({ windowId, url: urls[i], active: false });
-        if (hidden) await browser.tabs.hide(t.id).catch(() => {});
-      } catch (_) {}
-    }
-    if (t) {
-      pendingTabIds.delete(t.id);
-      tabWorkspace.set(t.id, wsName);
-      created.push(t);
-    }
-  }
-  if (hidden) await browser.tabs.hide(created.map((t) => t.id)).catch(() => {});
+// Guarantee a workspace has at least one tab (windows can't be empty).
+async function ensureTab(windowId, wsName, active) {
+  const tabs = await tabsForWorkspace(windowId, wsName);
+  if (tabs.length > 0) return tabs[0].id;
+  const t = await browser.tabs.create({ windowId, active });
+  await setTabWorkspace(t.id, wsName);
+  return t.id;
 }
 
-// ---- Core operations ----
-
-async function switchWorkspace(windowId, targetWorkspace) {
-  if (busyWindows.has(windowId)) return;
-  busyWindows.add(windowId);
-  try {
-    const current = activeByWindow.get(windowId) || null;
-    if (current === targetWorkspace) return;
-
-    const liveTarget = await liveTabIdsForWorkspace(targetWorkspace);
-    if (liveTarget.length === 0) {
-      await materializeWorkspace(windowId, targetWorkspace, { hidden: false });
-    } else {
-      await showWorkspaceTabs(targetWorkspace, true);
-    }
-
-    if (current && current !== targetWorkspace) {
-      await hideWorkspaceTabs(current);
-    }
-
-    activeByWindow.set(windowId, targetWorkspace);
-    updateBadge(windowId, targetWorkspace);
-    await setActiveWorkspace(targetWorkspace);
-
-    // Reconcile: hide any non-pinned visible tab that doesn't belong to the
-    // target. Corrects leaks no matter how they arose (event races, etc.).
-    await reconcileVisibleTabs(windowId, targetWorkspace);
-  } finally {
-    busyWindows.delete(windowId);
-  }
-}
-
-// Hide every visible non-pinned tab in the window that isn't owned by wsName.
-async function reconcileVisibleTabs(windowId, wsName) {
+// Hide every non-pinned visible tab in the window not owned by wsName.
+// This is the single source of correctness — runs after every structural op.
+async function reconcile(windowId, wsName) {
   let tabs;
   try { tabs = await browser.tabs.query({ windowId }); }
   catch (e) { return; }
   const stray = [];
   for (const t of tabs) {
-    if (t.hidden || t.pinned) continue;
-    if (tabWorkspace.get(t.id) !== wsName) stray.push(t.id);
+    if (t.pinned || t.hidden) continue;
+    if ((await getTabWorkspace(t.id)) !== wsName) stray.push(t.id);
   }
   if (stray.length) await browser.tabs.hide(stray).catch(() => {});
 }
 
-async function createWorkspace(windowId, newWorkspaceName) {
+// ---- core ops ----
+
+async function switchWorkspace(windowId, target) {
+  if (busyWindows.has(windowId)) return;
+  busyWindows.add(windowId);
+  try {
+    const current = activeByWindow.get(windowId) || null;
+    if (current === target) return;
+
+    await showWorkspace(windowId, target);
+    await ensureTab(windowId, target, true);
+    if (current && current !== target) await hideWorkspace(windowId, current);
+
+    activeByWindow.set(windowId, target);
+    updateBadge(windowId, target);
+    await setActiveWorkspace(target);
+    await reconcile(windowId, target);
+  } finally {
+    busyWindows.delete(windowId);
+  }
+}
+
+async function createWorkspace(windowId, name) {
   if (busyWindows.has(windowId)) return { success: false };
   busyWindows.add(windowId);
   try {
-    const { workspaces, order } = await getWorkspaces();
-    if (newWorkspaceName in workspaces) return { success: false, reason: "exists" };
-
-    workspaces[newWorkspaceName] = [];
-    order.push(newWorkspaceName);
-    await setWorkspaces(workspaces, order);
+    const order = await getOrder();
+    if (order.includes(name)) return { success: false, reason: "exists" };
+    await addWorkspaceName(name);
 
     const current = activeByWindow.get(windowId) || null;
 
     if (!current) {
-      // First workspace in an unassigned window — adopt existing tabs.
+      // First workspace in an unassigned window — adopt existing non-pinned tabs.
       const existing = await browser.tabs.query({ windowId });
-      const ownable = existing.filter((t) => !t.pinned); // pinned stay global
+      const ownable = existing.filter((t) => !t.pinned);
       if (ownable.length > 0) {
-        for (const t of ownable) tabWorkspace.set(t.id, newWorkspaceName);
+        for (const t of ownable) await setTabWorkspace(t.id, name);
       } else {
         const fresh = await browser.tabs.create({ windowId, active: true });
-        tabWorkspace.set(fresh.id, newWorkspaceName);
+        await setTabWorkspace(fresh.id, name);
       }
-      activeByWindow.set(windowId, newWorkspaceName);
-      updateBadge(windowId, newWorkspaceName);
-      await setActiveWorkspace(newWorkspaceName);
-      await persistWorkspaceUrls(newWorkspaceName);
-      return { success: true };
+    } else {
+      // Split off: fresh blank tab, hide the old workspace.
+      const fresh = await browser.tabs.create({ windowId, active: true });
+      await setTabWorkspace(fresh.id, name);
+      await hideWorkspace(windowId, current);
     }
 
-    // New workspace from an existing one — open a blank tab, hide the old set.
-    const fresh = await browser.tabs.create({ windowId, active: true });
-    tabWorkspace.set(fresh.id, newWorkspaceName);
-    await hideWorkspaceTabs(current);
-
-    activeByWindow.set(windowId, newWorkspaceName);
-    updateBadge(windowId, newWorkspaceName);
-    await setActiveWorkspace(newWorkspaceName);
-    await reconcileVisibleTabs(windowId, newWorkspaceName);
+    activeByWindow.set(windowId, name);
+    updateBadge(windowId, name);
+    await setActiveWorkspace(name);
+    await reconcile(windowId, name);
     return { success: true };
   } finally {
     busyWindows.delete(windowId);
   }
 }
 
-async function deleteWorkspace(windowId, wsName) {
+async function deleteWorkspace(windowId, name) {
   if (busyWindows.has(windowId)) return { success: false };
   busyWindows.add(windowId);
   try {
-    const { workspaces, order } = await getWorkspaces();
-    const wasActive = activeByWindow.get(windowId) === wsName;
-    const ids = tabIdsForWorkspace(wsName);
+    const wasActive = activeByWindow.get(windowId) === name;
+    const tabs = await tabsForWorkspace(windowId, name);
+    const ids = tabs.map((t) => t.id);
 
-    delete workspaces[wsName];
-    const newOrder = order.filter((n) => n !== wsName);
-    await setWorkspaces(workspaces, newOrder);
+    await removeWorkspaceName(name);
 
     if (wasActive) {
-      const next = newOrder[0] || null;
+      const order = await getOrder();
+      const next = order[0] || null;
       if (next) {
-        if (tabIdsForWorkspace(next).length === 0) {
-          await materializeWorkspace(windowId, next, { hidden: false });
-        } else {
-          await showWorkspaceTabs(next, true);
-        }
+        await showWorkspace(windowId, next);
+        await ensureTab(windowId, next, true);
         activeByWindow.set(windowId, next);
         updateBadge(windowId, next);
         await setActiveWorkspace(next);
@@ -320,8 +212,12 @@ async function deleteWorkspace(windowId, wsName) {
       }
     }
 
-    for (const id of ids) tabWorkspace.delete(id);
-    if (ids.length > 0) await browser.tabs.remove(ids).catch(() => {});
+    for (const id of ids) await clearTabWorkspace(id);
+    if (ids.length) await browser.tabs.remove(ids).catch(() => {});
+    if (wasActive) {
+      const cur = activeByWindow.get(windowId);
+      if (cur) await reconcile(windowId, cur);
+    }
     return { success: true };
   } finally {
     busyWindows.delete(windowId);
@@ -329,13 +225,16 @@ async function deleteWorkspace(windowId, wsName) {
 }
 
 async function renameWorkspace(windowId, oldName, newName) {
-  const { workspaces, order } = await getWorkspaces();
-  if (!(oldName in workspaces) || newName in workspaces) return { success: false };
-  workspaces[newName] = workspaces[oldName];
-  delete workspaces[oldName];
-  const newOrder = order.map((n) => (n === oldName ? newName : n));
-  await setWorkspaces(workspaces, newOrder);
-  for (const [tabId, ws] of tabWorkspace) if (ws === oldName) tabWorkspace.set(tabId, newName);
+  const order = await getOrder();
+  if (!order.includes(oldName) || order.includes(newName)) return { success: false };
+  await setOrder(order.map((n) => (n === oldName ? newName : n)));
+
+  // Relabel every tab in this window that belonged to oldName.
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
+  for (const t of tabs) {
+    if ((await getTabWorkspace(t.id)) === oldName) await setTabWorkspace(t.id, newName);
+  }
   if (activeByWindow.get(windowId) === oldName) {
     activeByWindow.set(windowId, newName);
     updateBadge(windowId, newName);
@@ -344,144 +243,124 @@ async function renameWorkspace(windowId, oldName, newName) {
   return { success: true };
 }
 
-// ---- Message handler ----
+// Tab counts per workspace, computed from ACTUAL live tagged tabs (never drifts).
+async function getCounts(windowId) {
+  const order = await getOrder();
+  const counts = {};
+  for (const n of order) counts[n] = 0;
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
+  for (const t of tabs) {
+    if (t.pinned) continue;
+    const ws = await getTabWorkspace(t.id);
+    if (ws && ws in counts) counts[ws]++;
+  }
+  return counts;
+}
 
-browser.runtime.onMessage.addListener(async (message) => {
-  switch (message.action) {
-    case "switch_workspace":
-      await switchWorkspace(message.windowId, message.workspace);
-      return { success: true };
-    case "create_workspace":
-      return await createWorkspace(message.windowId, message.workspace);
-    case "delete_workspace":
-      return await deleteWorkspace(message.windowId, message.workspace);
-    case "rename_workspace":
-      return await renameWorkspace(message.windowId, message.oldName, message.newName);
+// One-time reset: clear all workspace data and labels in this window.
+async function resetAll(windowId) {
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
+  for (const t of tabs) {
+    await clearTabWorkspace(t.id);
+    if (t.hidden) await browser.tabs.show(t.id).catch(() => {});
+  }
+  await browser.storage.local.set({ workspaceOrder: [], activeWorkspace: null });
+  activeByWindow.set(windowId, null);
+  updateBadge(windowId, null);
+  return { success: true };
+}
+
+// ---- messages ----
+
+browser.runtime.onMessage.addListener(async (m) => {
+  switch (m.action) {
+    case "switch_workspace": await switchWorkspace(m.windowId, m.workspace); return { success: true };
+    case "create_workspace": return await createWorkspace(m.windowId, m.workspace);
+    case "delete_workspace": return await deleteWorkspace(m.windowId, m.workspace);
+    case "rename_workspace": return await renameWorkspace(m.windowId, m.oldName, m.newName);
+    case "reset_all": return await resetAll(m.windowId);
     case "get_state": {
-      const { order } = await getWorkspaces();
-      return { active: activeByWindow.get(message.windowId) || null, order };
+      const order = await getOrder();
+      const counts = await getCounts(m.windowId);
+      return { active: activeByWindow.get(m.windowId) || null, order, counts };
     }
-    default:
-      return { success: false, reason: "unknown_action" };
+    default: return { success: false, reason: "unknown_action" };
   }
 });
 
-// ---- Tab event listeners ----
+// ---- tab events ----
 
-browser.tabs.onCreated.addListener((tab) => {
-  if (tabWorkspace.has(tab.id)) return;
-  if (pendingTabIds.has(tab.id)) return;
-  if (busyWindows.has(tab.windowId)) return;
-  if (tab.pinned) return; // pinned tabs are global — never owned
+// New tab opened by the user -> label it with the active workspace (unless pinned).
+browser.tabs.onCreated.addListener(async (tab) => {
+  if (busyWindows.has(tab.windowId)) return;       // internal op labels its own tabs
+  if (tab.pinned) return;                           // pinned = global
+  if (await getTabWorkspace(tab.id)) return;        // already labeled
   const ws = activeByWindow.get(tab.windowId);
-  if (ws) {
-    tabWorkspace.set(tab.id, ws);
-    persistWorkspaceUrls(ws);
+  if (ws) await setTabWorkspace(tab.id, ws);
+});
+
+// Pin/unpin transitions.
+browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.pinned === undefined) return;
+  if (changeInfo.pinned) {
+    await clearTabWorkspace(tabId);                 // became global
+  } else {
+    const ws = tab && activeByWindow.get(tab.windowId);
+    if (ws) await setTabWorkspace(tabId, ws);       // joins active workspace
   }
-});
+}, { properties: ["pinned"] });
 
-browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  const ws = tabWorkspace.get(tabId);
-  tabWorkspace.delete(tabId);
-  if (ws && !removeInfo.isWindowClosing) persistWorkspaceUrls(ws);
-});
+browser.windows.onRemoved.addListener((windowId) => activeByWindow.delete(windowId));
 
-const _updateTimers = new Map();
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // Pin/unpin transition.
-  if (changeInfo.pinned !== undefined) {
-    if (changeInfo.pinned) {
-      // Became pinned -> goes global. Drop from any workspace.
-      const ws = tabWorkspace.get(tabId);
-      tabWorkspace.delete(tabId);
-      if (ws) persistWorkspaceUrls(ws);
-    } else {
-      // Became unpinned -> joins the active workspace of its window.
-      const windowId = tab && tab.windowId;
-      const ws = windowId !== undefined ? activeByWindow.get(windowId) : null;
-      if (ws) {
-        tabWorkspace.set(tabId, ws);
-        persistWorkspaceUrls(ws);
-      }
-    }
-    return;
-  }
-  if (changeInfo.status !== "complete" && changeInfo.url === undefined) return;
-  const ws = tabWorkspace.get(tabId);
-  if (!ws) return;
-  if (_updateTimers.has(ws)) clearTimeout(_updateTimers.get(ws));
-  _updateTimers.set(ws, setTimeout(() => {
-    _updateTimers.delete(ws);
-    persistWorkspaceUrls(ws);
-  }, 500));
-});
-
-browser.windows.onRemoved.addListener((windowId) => {
-  activeByWindow.delete(windowId);
-});
-
-// ---- Bootstrap (startup + install) ----
+// ---- bootstrap (startup + install) ----
+// We DO NOT recreate tabs. Firefox already restored them with their labels
+// intact (sessions API). We just read labels and hide everything except the
+// last-active workspace.
 
 async function bootstrap() {
-  tabWorkspace.clear();
   activeByWindow.clear();
-
-  const { workspaces, order } = await getWorkspaces();
-  const data = await browser.storage.local.get("activeWorkspace");
-  const lastActive = data.activeWorkspace || null;
 
   let win;
   try { win = await browser.windows.getLastFocused({ windowTypes: ["normal"] }); }
   catch (e) { return; }
   const windowId = win.id;
 
+  const order = await getOrder();
   if (order.length === 0) {
     activeByWindow.set(windowId, null);
     updateBadge(windowId, null);
     return;
   }
 
-  const target = (lastActive && lastActive in workspaces) ? lastActive : order[0];
+  const lastActive = await getActiveWorkspace();
+  const target = (lastActive && order.includes(lastActive)) ? lastActive : order[0];
 
-  // Adopt whatever Firefox session-restored into this window.
-  // Storage is the source of truth — reconcile against it rather than
-  // blindly trusting the restored tab set, which can be partial.
-  const existingTabs = await browser.tabs.query({ windowId });
-  const storedUrls = new Set(workspaces[target] || []);
-  const restoredUrls = new Set();
-
-  for (const t of existingTabs) {
-    if (t.pinned) continue; // pinned tabs are global
-    tabWorkspace.set(t.id, target);
-    if (isRestorableUrl(t.url)) restoredUrls.add(t.url);
+  // Any restored tab with no label and not pinned: it's an orphan from before
+  // the extension existed, or a fresh session tab — assign it to target so it
+  // isn't stranded invisible.
+  let tabs;
+  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
+  for (const t of tabs) {
+    if (t.pinned) continue;
+    const ws = await getTabWorkspace(t.id);
+    if (!ws) await setTabWorkspace(t.id, target);
   }
 
-  // Recreate any stored URLs that session restore missed.
-  const missing = [...storedUrls].filter((u) => !restoredUrls.has(u));
-  for (const url of missing) {
-    try {
-      const t = await browser.tabs.create({ windowId, url, active: false, discarded: true });
-      tabWorkspace.set(t.id, target);
-    } catch (e) {
-      try {
-        const t = await browser.tabs.create({ windowId, url, active: false });
-        tabWorkspace.set(t.id, target);
-      } catch (_) {}
-    }
-  }
+  await ensureTab(windowId, target, true);
+  await showWorkspace(windowId, target);
 
-  await ensureWorkspaceHasTab(windowId, target, true);
-
-  // Materialize all other workspaces as hidden + discarded.
+  // Hide every other workspace's tabs.
   for (const name of order) {
     if (name === target) continue;
-    await materializeWorkspace(windowId, name, { hidden: true });
+    await hideWorkspace(windowId, name);
   }
 
   activeByWindow.set(windowId, target);
   updateBadge(windowId, target);
   await setActiveWorkspace(target);
-  await persistWorkspaceUrls(target);
+  await reconcile(windowId, target);
 }
 
 browser.runtime.onStartup.addListener(bootstrap);

@@ -19,6 +19,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const state = await browser.runtime.sendMessage({ action: "get_state", windowId });
   let currentWorkspace = state.active;
   let order = state.order || [];
+  let counts = state.counts || {};
 
   function refreshBanner() {
     if (currentWorkspace) {
@@ -76,18 +77,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     return null;
   }
 
-  async function getWorkspaceData() {
-    const data = await browser.storage.local.get(["workspaces", "workspaceOrder"]);
-    const workspaces = data.workspaces || {};
-    let ord = data.workspaceOrder || Object.keys(workspaces);
-    ord = ord.filter((n) => n in workspaces);
-    return { workspaces, order: ord };
+  async function refreshState() {
+    const st = await browser.runtime.sendMessage({ action: "get_state", windowId });
+    currentWorkspace = st.active;
+    order = st.order || [];
+    counts = st.counts || {};
+    return st;
   }
 
   async function renderList() {
     listContainer.innerHTML = "";
-    const { workspaces, order: ord } = await getWorkspaceData();
-    order = ord;
+    await refreshState();
 
     if (order.length === 0) {
       const empty = document.createElement("div");
@@ -98,7 +98,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     order.forEach((name) => {
-      const urls = workspaces[name] || [];
+      const count = counts[name] || 0;
       const item = document.createElement("div");
       item.className = "workspace-item";
       if (name === currentWorkspace) item.classList.add("active");
@@ -111,8 +111,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       const tabCount = document.createElement("span");
       tabCount.className = "workspace-tabs";
-      tabCount.textContent = urls.length;
-      tabCount.title = `${urls.length} tab${urls.length !== 1 ? "s" : ""}`;
+      tabCount.textContent = count;
+      tabCount.title = `${count} tab${count !== 1 ? "s" : ""}`;
       item.appendChild(tabCount);
 
       // Rename
@@ -137,8 +137,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (!ok) return;
         const resp = await browser.runtime.sendMessage({ action: "delete_workspace", windowId, workspace: name });
         if (resp.success) {
-          const st = await browser.runtime.sendMessage({ action: "get_state", windowId });
-          currentWorkspace = st.active;
+          await refreshState();
           refreshBanner();
           renderList();
         }
@@ -170,8 +169,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     async function commit() {
       const newName = input.value.trim();
       if (!newName || newName === oldName) { renderList(); return; }
-      const { workspaces } = await getWorkspaceData();
-      if (newName in workspaces) { input.style.borderColor = "#d73a49"; return; }
+      if (order.includes(newName)) { input.style.borderColor = "#d73a49"; return; }
       const resp = await browser.runtime.sendMessage({
         action: "rename_workspace", windowId, oldName, newName
       });
@@ -193,9 +191,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const name = nameInput.value.trim();
     if (!name) return;
 
-    const { workspaces } = await getWorkspaceData();
-
-    if (name in workspaces) {
+    if (order.includes(name)) {
       // Existing -> switch
       if (name === currentWorkspace) { window.close(); return; }
       setBusy("Switching\u2026");
@@ -259,6 +255,22 @@ document.addEventListener("DOMContentLoaded", async () => {
       items[highlightIndex].click();
     }
   });
+
+  // Reset all — clears every workspace label and un-hides all tabs (recovery
+  // from a corrupted state). Tabs are kept; only assignments are wiped.
+  const resetLink = document.getElementById("reset-link");
+  if (resetLink) {
+    resetLink.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const ok = await showConfirm(
+        "Reset all workspaces? This clears every workspace and un-hides all tabs. Your tabs are kept. This cannot be undone.",
+        "Reset"
+      );
+      if (!ok) return;
+      await browser.runtime.sendMessage({ action: "reset_all", windowId });
+      window.close();
+    });
+  }
 
   renderList();
 });
