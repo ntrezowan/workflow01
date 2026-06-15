@@ -1,129 +1,52 @@
 # Workflow01
 
-Single-window workspace manager for Firefox. Organize your tabs into named workspaces and switch between them instantly — without reloading.
+Single-window workspace manager for Firefox. Organize live tabs into named workspaces and switch between them without closing, recreating, or intentionally reloading tabs.
 
-[![Install](https://img.shields.io/badge/Install-Firefox%20Add--ons-FF7139?logo=firefox-browser&logoColor=white)](https://addons.mozilla.org/en-US/firefox/addon/workflow01/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+## Interface
 
----
+- Native-looking Firefox popup using system colors instead of custom gradients.
+- Simple current-workspace text block with smaller text and no banner color/image.
+- Larger workspace rows for easier clicking.
+- Click `+` to reveal the create-workspace form.
+- Press `Enter` in the create form to create a workspace.
+- Press `Escape` in the create form to hide it.
+- Use arrow keys to highlight workspaces and `Enter` to switch.
 
-## Features
+## Behavior
 
-- **Zero-reload switching** — tabs are never closed or recreated when switching workspaces. Scroll position, form input, and media stay exactly where you left them.
-- **Fresh workspace creation** — creating a workspace opens a single blank tab and switches to it. Nothing is stolen from your current workspace.
-- **Inline rename** — hover any workspace row and click ✎ to rename in place.
-- **Keyboard navigation** — arrow keys to move through the list, Enter to switch. No mouse required.
-- **Active workspace highlight** — the popup always shows which workspace you're in, with tab count.
-- **Confirm before delete** — no accidental workspace deletions.
-- **Theme-aware icon** — split circle that adapts automatically: top-white/bottom-black on light toolbars, top-black/bottom-white on dark toolbars.
-- **Keyboard shortcut** — `Ctrl+Shift+Y` (`Cmd+Shift+Y` on Mac).
-- **Light and dark popup theme** — follows your system preference.
-- **Pinned tabs are global** — a pinned tab stays visible in every workspace (Firefox can't hide pinned tabs, so this is intentional). Unpin it to assign it to the current workspace.
-- **Restart persistence** — last active workspace is restored on Firefox restart. Other workspaces are rebuilt as hidden/unloaded tabs, loaded only when you visit them.
-
----
-
-## How It Works
-
-1. Click the Workflow01 icon (or press `Ctrl+Shift+Y`)
-2. Type a workspace name and press **Enter** to create it
-3. Your current tabs become that workspace — browse normally
-4. To switch: click another workspace in the list (or arrow keys + Enter). Tabs are hidden instantly, target workspace tabs are shown. No reloads.
-5. To create a new workspace: type a new name, press Enter. A fresh blank tab opens. Your previous workspace is untouched.
-
----
-
-## Install
-
-### From Firefox Add-ons
-
-[addons.mozilla.org/en-US/firefox/addon/workflow01](https://addons.mozilla.org/en-US/firefox/addon/workflow01/)
-
-### From source
-
-1. Clone or download this repo
-2. Open Firefox → `about:debugging#/runtime/this-firefox`
-3. Click **Load Temporary Add-on…**
-4. Select `manifest.json` from the repo folder
-
-> **First use:** When you first switch a workspace, Firefox shows a one-time prompt: "An extension is hiding tabs." Click **Allow** — this is required for switching to work.
-
----
+- First workspace adopts currently visible non-pinned tabs.
+- Later workspaces open one blank tab and do not steal tabs from the current workspace.
+- Switching workspaces only hides and shows tabs.
+- Workflow01 does not close, recreate, intentionally reload, or discard tabs.
+- Pinned tabs are global because Firefox does not allow extensions to hide pinned tabs.
 
 ## Permissions
 
-| Permission | Why it's needed |
+| Permission | Why it is needed |
 |---|---|
-| `tabs` | Read and manage tabs for workspace tracking |
-| `tabHide` | Hide/show tabs when switching — without this every switch would reload all tabs |
-| `storage` | Persist the workspace list locally on your device |
-| `sessions` | Tag each tab with its workspace so the assignment survives Firefox restart without recreating tabs |
+| `tabs` | Read and manage browser tabs for workspace assignment and switching. |
+| `tabHide` | Hide and show workspace tabs without closing or recreating tabs. |
+| `storage` | Store workspace metadata and active workspace locally. |
+| `sessions` | Store each tab's workspace ID on the tab so ownership can survive Firefox session restore. |
 
-No data is collected or sent anywhere. Everything stays on your machine.
+Workflow01 does not transmit user data outside Firefox.
 
----
+## Local testing
 
-## File Structure
+1. Open Firefox.
+2. Go to `about:debugging#/runtime/this-firefox`.
+3. Click **Load Temporary Add-on…**.
+4. Select `manifest.json` from the project folder.
+5. If Firefox asks to allow hidden tabs, choose **Allow**.
 
-```
-workflow01/
-├── manifest.json
-├── background.js
-├── popup.html
-├── popup.js
-└── icons/
-    ├── icon-48.png          # Default fallback icon
-    ├── icon-128.png
-    ├── icon-day-48.png      # Light toolbar: top white, bottom black
-    ├── icon-day-128.png
-    ├── icon-night-48.png    # Dark toolbar: top black, bottom white
-    └── icon-night-128.png
-```
+## Version 5.2 changes
 
----
-
-## Version History
-
-### v4.0
-- **Rewrote the persistence layer** to tag tabs via the `sessions` API instead of storing URL lists and recreating tabs on startup. This eliminates the tab-duplication bug (workspaces accumulating dozens of copied tabs across restarts) at the root — tabs are never recreated, so they can never multiply.
-- Tab counts are now computed from actual live tabs, so they never drift from reality
-- Added "Reset all workspaces" link to recover from any corrupted state
-- Requires the `sessions` permission
-
-### v3.3
-- Fixed: pinned tabs no longer leak as broken duplicates — they are now treated as global (visible in all workspaces by design)
-- Fixed: tab leakage between workspaces — added a reconciliation pass that hides any tab not belonging to the active workspace on every switch
-- Pin/unpin transitions handled correctly (pinning removes a tab from its workspace; unpinning assigns it to the active one)
-
-### v3.2
-- Fixed: tab duplication bug where switching caused the same tab to appear in multiple workspaces
-- Fixed: spurious blank tabs appearing after workspace switch
-- Fixed: `onCreated` listener double-assigning tabs created by internal operations
-- Fixed: `onUpdated` debounced to prevent storage write races on rapid navigation
-
-### v3.1
-- Fixed: privileged URLs (`about:*`, `moz-extension://`, etc.) excluded from storage
-- Fixed: empty workspace guard
-- Fixed: restart reconciliation uses storage as source of truth
-- Fixed: persist queue self-cleans after settling
-- Added: "Switching…" overlay in popup during background operations
-- Added: workspace name validation
-- Added: keyboard navigation (arrow keys + Enter)
-- Added: theme-aware split circle icon
-
-### v3.0
-- Complete rewrite: `tabs.hide()` / `tabs.show()` replaces close/recreate model
-- Tabs no longer reload when switching workspaces
-- New workspace creation no longer steals the active tab
-- Removed export/import
-- Added inline rename
-- Compact popup design
-
-### v2.0
-- Initial public release
-
----
+- Replaced the custom blue current-workspace banner with a simple native-style text block.
+- Removed decorative image/gradient treatment from the current workspace area.
+- Increased workspace row size for easier clicking.
+- Kept the `+` create-workspace flow.
+- Kept v5 workspace behavior: no tab stealing, no close/recreate switching, stable workspace IDs.
 
 ## License
 
-[MIT](LICENSE)
+MIT

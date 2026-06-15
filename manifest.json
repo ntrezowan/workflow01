@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Workflow01",
-  "version": "4.0",
-  "description": "Single-window workspace manager for Firefox. Switch between workspaces instantly without reloading your tabs.",
+  "version": "5.2",
+  "description": "Single-window workspace manager for Firefox. Switch between named workspaces without closing, recreating, or reloading tabs.",
   "permissions": [
     "tabs",
     "tabHide",

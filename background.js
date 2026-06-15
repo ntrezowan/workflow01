@@ -1,366 +1,359 @@
-// Workflow01 — Background Service (v4.0)
-//
-// MODEL: every tab carries a persistent workspace label written with
-// browser.sessions.setTabValue(). The label rides along with Firefox's own
-// session restore, so we NEVER recreate tabs from URL lists and duplication
-// is impossible. Active workspace's tabs are shown; all others are hidden.
-//
-// Pinned tabs are GLOBAL — never labeled, never hidden, shown everywhere.
-//
-// storage.local:
-//   workspaceOrder  -> [name, ...]      (display order + the canonical list)
-//   activeWorkspace -> name | null      (restored on startup)
-// sessions (per-tab, survives restart):
-//   "workspace" -> name                 (which workspace a tab belongs to)
+// Workflow01 — Background Service (v5.2)
+// Firefox owns tab lifetime. Workflow01 owns only workspace labels and visibility.
+// Switching workspaces never closes, recreates, discards, or intentionally reloads tabs.
 
-const TAB_KEY = "workspace";
-
-// windowId -> active workspace name (in-memory, current session)
+const TAB_KEY = "workflow01.workspaceId";
+const LEGACY_TAB_KEY = "workspace";
+const SCHEMA_VERSION = 5;
 const activeByWindow = new Map();
-// Re-entrancy guard per window for structural ops.
 const busyWindows = new Set();
 
-// ---- storage.local: workspace list + active ----
+const now = () => Date.now();
+const cleanName = (name) => String(name || "").trim();
 
-async function getOrder() {
-  const d = await browser.storage.local.get("workspaceOrder");
-  return Array.isArray(d.workspaceOrder) ? d.workspaceOrder : [];
-}
-async function setOrder(order) {
-  await browser.storage.local.set({ workspaceOrder: order });
-}
-async function addWorkspaceName(name) {
-  const order = await getOrder();
-  if (!order.includes(name)) { order.push(name); await setOrder(order); }
-}
-async function removeWorkspaceName(name) {
-  const order = (await getOrder()).filter((n) => n !== name);
-  await setOrder(order);
-}
-async function setActiveWorkspace(name) {
-  await browser.storage.local.set({ activeWorkspace: name });
-}
-async function getActiveWorkspace() {
-  const d = await browser.storage.local.get("activeWorkspace");
-  return d.activeWorkspace || null;
+function newId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") return `ws_${globalThis.crypto.randomUUID()}`;
+  return `ws_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
-// ---- per-tab label (sessions API) ----
-
-async function getTabWorkspace(tabId) {
-  try { return (await browser.sessions.getTabValue(tabId, TAB_KEY)) || null; }
-  catch (e) { return null; }
-}
-async function setTabWorkspace(tabId, name) {
-  try { await browser.sessions.setTabValue(tabId, TAB_KEY, name); } catch (e) {}
-}
-async function clearTabWorkspace(tabId) {
-  try { await browser.sessions.removeTabValue(tabId, TAB_KEY); } catch (e) {}
+function emptyState() {
+  return { schemaVersion: SCHEMA_VERSION, workspaces: {}, workspaceOrder: [], activeWorkspaceId: null };
 }
 
-// All non-pinned tabs in a window belonging to wsName.
-async function tabsForWorkspace(windowId, wsName) {
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); }
-  catch (e) { return []; }
-  const out = [];
-  for (const t of tabs) {
-    if (t.pinned) continue;
-    if ((await getTabWorkspace(t.id)) === wsName) out.push(t);
+async function saveState(state) {
+  await browser.storage.local.set({
+    schemaVersion: SCHEMA_VERSION,
+    workspaces: state.workspaces,
+    workspaceOrder: state.workspaceOrder,
+    activeWorkspaceId: state.activeWorkspaceId || null,
+  });
+}
+
+async function loadState() {
+  const data = await browser.storage.local.get(null);
+
+  if (data.workspaces && typeof data.workspaces === "object" && Array.isArray(data.workspaceOrder)) {
+    const state = {
+      schemaVersion: SCHEMA_VERSION,
+      workspaces: data.workspaces,
+      workspaceOrder: data.workspaceOrder.filter((id) => data.workspaces[id]),
+      activeWorkspaceId: data.activeWorkspaceId || null,
+    };
+    if (state.activeWorkspaceId && !state.workspaces[state.activeWorkspaceId]) state.activeWorkspaceId = state.workspaceOrder[0] || null;
+    return state;
   }
+
+  if (Array.isArray(data.workspaceOrder)) {
+    const state = emptyState();
+    const map = {};
+    for (const oldName of data.workspaceOrder) {
+      const name = cleanName(oldName);
+      if (!name || map[name]) continue;
+      const id = newId();
+      map[name] = id;
+      state.workspaces[id] = { id, name, createdAt: now(), updatedAt: now() };
+      state.workspaceOrder.push(id);
+    }
+    const oldActive = cleanName(data.activeWorkspace);
+    state.activeWorkspaceId = oldActive && map[oldActive] ? map[oldActive] : (state.workspaceOrder[0] || null);
+    await saveState(state);
+    await browser.storage.local.set({ legacyWorkspaceNameToId: map });
+    return state;
+  }
+
+  const state = emptyState();
+  await saveState(state);
+  return state;
+}
+
+async function workspaceIdByName(name) {
+  const state = await loadState();
+  const target = cleanName(name);
+  for (const id of state.workspaceOrder) if (state.workspaces[id]?.name === target) return id;
+  return null;
+}
+
+async function getTabWorkspaceId(tabId) {
+  try {
+    const id = await browser.sessions.getTabValue(tabId, TAB_KEY);
+    if (id) return id;
+  } catch (_) {}
+
+  try {
+    const legacyName = await browser.sessions.getTabValue(tabId, LEGACY_TAB_KEY);
+    if (!legacyName) return null;
+    const id = await workspaceIdByName(legacyName);
+    if (id) {
+      await setTabWorkspaceId(tabId, id);
+      return id;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+async function setTabWorkspaceId(tabId, workspaceId) {
+  try { await browser.sessions.setTabValue(tabId, TAB_KEY, workspaceId); } catch (_) {}
+}
+
+async function clearTabWorkspaceId(tabId) {
+  try { await browser.sessions.removeTabValue(tabId, TAB_KEY); } catch (_) {}
+  try { await browser.sessions.removeTabValue(tabId, LEGACY_TAB_KEY); } catch (_) {}
+}
+
+async function tabs(query) { try { return await browser.tabs.query(query); } catch (_) { return []; } }
+async function normalWindows() { try { return await browser.windows.getAll({ windowTypes: ["normal"] }); } catch (_) { return []; } }
+function ownable(tab) { return tab && tab.id !== undefined && !tab.pinned; }
+
+async function activeId() { return (await loadState()).activeWorkspaceId || null; }
+async function setActiveId(id) {
+  const state = await loadState();
+  state.activeWorkspaceId = id && state.workspaces[id] ? id : null;
+  await saveState(state);
+  return state.activeWorkspaceId;
+}
+
+async function updateBadge(windowId, id) {
+  const state = await loadState();
+  const ws = id ? state.workspaces[id] : null;
+  if (!ws) { await browser.action.setBadgeText({ text: "", windowId }).catch(() => {}); return; }
+  await browser.action.setBadgeText({ text: ws.name.slice(0,3).toUpperCase(), windowId }).catch(() => {});
+  await browser.action.setBadgeBackgroundColor({ color: "#0060df", windowId }).catch(() => {});
+  if (browser.action.setBadgeTextColor) await browser.action.setBadgeTextColor({ color: "#ffffff", windowId }).catch(() => {});
+}
+
+async function activeForWindow(windowId) {
+  if (activeByWindow.has(windowId)) return activeByWindow.get(windowId) || null;
+  const id = await activeId();
+  activeByWindow.set(windowId, id);
+  await updateBadge(windowId, id);
+  return id;
+}
+
+async function setActiveForWindow(windowId, id) {
+  const active = await setActiveId(id);
+  activeByWindow.set(windowId, active);
+  await updateBadge(windowId, active);
+  return active;
+}
+
+async function withBusy(windowId, fn) {
+  if (busyWindows.has(windowId)) return { success: false, reason: "busy" };
+  busyWindows.add(windowId);
+  try { return await fn(); } finally { busyWindows.delete(windowId); }
+}
+
+async function tabsForWorkspace(windowId, id) {
+  const out = [];
+  for (const tab of await tabs({ windowId })) if (ownable(tab) && (await getTabWorkspaceId(tab.id)) === id) out.push(tab);
   return out;
 }
 
-// ---- badge ----
+async function showWorkspace(windowId, id) {
+  const owned = await tabsForWorkspace(windowId, id);
+  const ids = owned.map((tab) => tab.id);
+  if (ids.length) await browser.tabs.show(ids).catch(() => {});
+  return owned;
+}
 
-function updateBadge(windowId, name) {
-  if (name) {
-    browser.action.setBadgeText({ text: name.substring(0, 3).toUpperCase(), windowId });
-    browser.action.setBadgeBackgroundColor({ color: "#0060df", windowId });
-    if (browser.action.setBadgeTextColor) browser.action.setBadgeTextColor({ color: "#ffffff", windowId });
-  } else {
-    browser.action.setBadgeText({ text: "", windowId });
+async function ensureWorkspaceTab(windowId, id) {
+  const owned = await tabsForWorkspace(windowId, id);
+  if (owned.length) return owned[0].id;
+  await setActiveForWindow(windowId, id);
+  const tab = await browser.tabs.create({ windowId, active: true });
+  await setTabWorkspaceId(tab.id, id);
+  return tab.id;
+}
+
+async function activateWorkspaceTab(windowId, id) {
+  const owned = await tabsForWorkspace(windowId, id);
+  const tab = owned.find((candidate) => !candidate.hidden) || owned[0];
+  if (!tab) return null;
+  await browser.tabs.show(tab.id).catch(() => {});
+  await browser.tabs.update(tab.id, { active: true }).catch(() => {});
+  return tab.id;
+}
+
+async function hideOtherKnownTabs(windowId, activeWorkspaceId) {
+  const state = await loadState();
+  const known = new Set(state.workspaceOrder);
+  const toHide = [];
+  for (const tab of await tabs({ windowId })) {
+    if (!ownable(tab) || tab.hidden) continue;
+    const owner = await getTabWorkspaceId(tab.id);
+    if (owner && owner !== activeWorkspaceId && known.has(owner)) toHide.push(tab.id);
   }
-}
-
-// ---- show / hide ----
-
-async function showWorkspace(windowId, wsName) {
-  const tabs = await tabsForWorkspace(windowId, wsName);
-  if (tabs.length === 0) return null;
-  const ids = tabs.map((t) => t.id);
-  await browser.tabs.show(ids).catch(() => {});
-  // activate the first one
-  for (const id of ids) {
-    try { await browser.tabs.update(id, { active: true }); return id; }
-    catch (e) {}
-  }
-  return ids[0];
-}
-
-async function hideWorkspace(windowId, wsName) {
-  const tabs = await tabsForWorkspace(windowId, wsName);
-  const ids = tabs.filter((t) => !t.pinned).map((t) => t.id);
-  if (ids.length) await browser.tabs.hide(ids).catch(() => {});
-}
-
-// Guarantee a workspace has at least one tab (windows can't be empty).
-async function ensureTab(windowId, wsName, active) {
-  const tabs = await tabsForWorkspace(windowId, wsName);
-  if (tabs.length > 0) return tabs[0].id;
-  const t = await browser.tabs.create({ windowId, active });
-  await setTabWorkspace(t.id, wsName);
-  return t.id;
-}
-
-// Hide every non-pinned visible tab in the window not owned by wsName.
-// This is the single source of correctness — runs after every structural op.
-async function reconcile(windowId, wsName) {
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); }
-  catch (e) { return; }
-  const stray = [];
-  for (const t of tabs) {
-    if (t.pinned || t.hidden) continue;
-    if ((await getTabWorkspace(t.id)) !== wsName) stray.push(t.id);
-  }
-  if (stray.length) await browser.tabs.hide(stray).catch(() => {});
-}
-
-// ---- core ops ----
-
-async function switchWorkspace(windowId, target) {
-  if (busyWindows.has(windowId)) return;
-  busyWindows.add(windowId);
-  try {
-    const current = activeByWindow.get(windowId) || null;
-    if (current === target) return;
-
-    await showWorkspace(windowId, target);
-    await ensureTab(windowId, target, true);
-    if (current && current !== target) await hideWorkspace(windowId, current);
-
-    activeByWindow.set(windowId, target);
-    updateBadge(windowId, target);
-    await setActiveWorkspace(target);
-    await reconcile(windowId, target);
-  } finally {
-    busyWindows.delete(windowId);
-  }
+  if (toHide.length) await browser.tabs.hide(toHide).catch(() => {});
 }
 
 async function createWorkspace(windowId, name) {
-  if (busyWindows.has(windowId)) return { success: false };
-  busyWindows.add(windowId);
-  try {
-    const order = await getOrder();
-    if (order.includes(name)) return { success: false, reason: "exists" };
-    await addWorkspaceName(name);
+  return await withBusy(windowId, async () => {
+    const workspaceName = cleanName(name);
+    if (!workspaceName) return { success: false, reason: "empty" };
+    const state = await loadState();
+    for (const id of state.workspaceOrder) if (state.workspaces[id]?.name === workspaceName) return { success: false, reason: "exists" };
 
-    const current = activeByWindow.get(windowId) || null;
+    const id = newId();
+    const isFirst = state.workspaceOrder.length === 0;
+    state.workspaces[id] = { id, name: workspaceName, createdAt: now(), updatedAt: now() };
+    state.workspaceOrder.push(id);
+    state.activeWorkspaceId = id;
+    await saveState(state);
+    await setActiveForWindow(windowId, id);
 
-    if (!current) {
-      // First workspace in an unassigned window — adopt existing non-pinned tabs.
-      const existing = await browser.tabs.query({ windowId });
-      const ownable = existing.filter((t) => !t.pinned);
-      if (ownable.length > 0) {
-        for (const t of ownable) await setTabWorkspace(t.id, name);
-      } else {
-        const fresh = await browser.tabs.create({ windowId, active: true });
-        await setTabWorkspace(fresh.id, name);
-      }
+    if (isFirst) {
+      const visible = (await tabs({ windowId })).filter((tab) => ownable(tab) && !tab.hidden);
+      if (visible.length) for (const tab of visible) await setTabWorkspaceId(tab.id, id);
+      else await ensureWorkspaceTab(windowId, id);
     } else {
-      // Split off: fresh blank tab, hide the old workspace.
-      const fresh = await browser.tabs.create({ windowId, active: true });
-      await setTabWorkspace(fresh.id, name);
-      await hideWorkspace(windowId, current);
+      const tab = await browser.tabs.create({ windowId, active: true });
+      await setTabWorkspaceId(tab.id, id);
+      await browser.tabs.show(tab.id).catch(() => {});
     }
-
-    activeByWindow.set(windowId, name);
-    updateBadge(windowId, name);
-    await setActiveWorkspace(name);
-    await reconcile(windowId, name);
+    await hideOtherKnownTabs(windowId, id);
     return { success: true };
-  } finally {
-    busyWindows.delete(windowId);
-  }
+  });
+}
+
+async function switchWorkspace(windowId, name) {
+  return await withBusy(windowId, async () => {
+    const id = await workspaceIdByName(name);
+    if (!id) return { success: false, reason: "missing" };
+    await setActiveForWindow(windowId, id);
+    await showWorkspace(windowId, id);
+    await ensureWorkspaceTab(windowId, id);
+    await activateWorkspaceTab(windowId, id);
+    await hideOtherKnownTabs(windowId, id);
+    return { success: true };
+  });
 }
 
 async function deleteWorkspace(windowId, name) {
-  if (busyWindows.has(windowId)) return { success: false };
-  busyWindows.add(windowId);
-  try {
-    const wasActive = activeByWindow.get(windowId) === name;
-    const tabs = await tabsForWorkspace(windowId, name);
-    const ids = tabs.map((t) => t.id);
+  return await withBusy(windowId, async () => {
+    const id = await workspaceIdByName(name);
+    if (!id) return { success: false, reason: "missing" };
+    const state = await loadState();
+    const ownedTabs = await tabsForWorkspace(windowId, id);
+    const tabIds = ownedTabs.map((tab) => tab.id);
 
-    await removeWorkspaceName(name);
+    delete state.workspaces[id];
+    state.workspaceOrder = state.workspaceOrder.filter((candidate) => candidate !== id);
+    if (state.activeWorkspaceId === id) state.activeWorkspaceId = state.workspaceOrder[0] || null;
+    await saveState(state);
+    await setActiveForWindow(windowId, state.activeWorkspaceId);
 
-    if (wasActive) {
-      const order = await getOrder();
-      const next = order[0] || null;
-      if (next) {
-        await showWorkspace(windowId, next);
-        await ensureTab(windowId, next, true);
-        activeByWindow.set(windowId, next);
-        updateBadge(windowId, next);
-        await setActiveWorkspace(next);
-      } else {
-        activeByWindow.set(windowId, null);
-        updateBadge(windowId, null);
-        await setActiveWorkspace(null);
-      }
+    if (state.activeWorkspaceId) {
+      await showWorkspace(windowId, state.activeWorkspaceId);
+      await ensureWorkspaceTab(windowId, state.activeWorkspaceId);
+      await activateWorkspaceTab(windowId, state.activeWorkspaceId);
     }
 
-    for (const id of ids) await clearTabWorkspace(id);
-    if (ids.length) await browser.tabs.remove(ids).catch(() => {});
-    if (wasActive) {
-      const cur = activeByWindow.get(windowId);
-      if (cur) await reconcile(windowId, cur);
-    }
+    for (const tabId of tabIds) await clearTabWorkspaceId(tabId);
+    if (tabIds.length) await browser.tabs.remove(tabIds).catch(() => {});
+    if (state.activeWorkspaceId) await hideOtherKnownTabs(windowId, state.activeWorkspaceId);
     return { success: true };
-  } finally {
-    busyWindows.delete(windowId);
-  }
+  });
 }
 
 async function renameWorkspace(windowId, oldName, newName) {
-  const order = await getOrder();
-  if (!order.includes(oldName) || order.includes(newName)) return { success: false };
-  await setOrder(order.map((n) => (n === oldName ? newName : n)));
-
-  // Relabel every tab in this window that belonged to oldName.
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
-  for (const t of tabs) {
-    if ((await getTabWorkspace(t.id)) === oldName) await setTabWorkspace(t.id, newName);
-  }
-  if (activeByWindow.get(windowId) === oldName) {
-    activeByWindow.set(windowId, newName);
-    updateBadge(windowId, newName);
-    await setActiveWorkspace(newName);
-  }
-  return { success: true };
+  return await withBusy(windowId, async () => {
+    const id = await workspaceIdByName(oldName);
+    const name = cleanName(newName);
+    if (!id || !name) return { success: false, reason: "invalid" };
+    const state = await loadState();
+    for (const other of state.workspaceOrder) if (other !== id && state.workspaces[other]?.name === name) return { success: false, reason: "exists" };
+    state.workspaces[id].name = name;
+    state.workspaces[id].updatedAt = now();
+    await saveState(state);
+    if ((await activeForWindow(windowId)) === id) await updateBadge(windowId, id);
+    return { success: true };
+  });
 }
 
-// Tab counts per workspace, computed from ACTUAL live tagged tabs (never drifts).
-async function getCounts(windowId) {
-  const order = await getOrder();
+async function countsByName(windowId) {
+  const state = await loadState();
   const counts = {};
-  for (const n of order) counts[n] = 0;
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
-  for (const t of tabs) {
-    if (t.pinned) continue;
-    const ws = await getTabWorkspace(t.id);
-    if (ws && ws in counts) counts[ws]++;
+  for (const id of state.workspaceOrder) counts[id] = 0;
+  for (const tab of await tabs({ windowId })) {
+    if (!ownable(tab)) continue;
+    const owner = await getTabWorkspaceId(tab.id);
+    if (owner && Object.prototype.hasOwnProperty.call(counts, owner)) counts[owner]++;
   }
-  return counts;
+  const out = {};
+  for (const id of state.workspaceOrder) if (state.workspaces[id]) out[state.workspaces[id].name] = counts[id] || 0;
+  return out;
 }
 
-// One-time reset: clear all workspace data and labels in this window.
+async function getState(windowId) {
+  const state = await loadState();
+  const id = await activeForWindow(windowId);
+  return {
+    active: id && state.workspaces[id] ? state.workspaces[id].name : null,
+    order: state.workspaceOrder.map((workspaceId) => state.workspaces[workspaceId]).filter(Boolean).map((workspace) => workspace.name),
+    counts: await countsByName(windowId),
+  };
+}
+
 async function resetAll(windowId) {
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
-  for (const t of tabs) {
-    await clearTabWorkspace(t.id);
-    if (t.hidden) await browser.tabs.show(t.id).catch(() => {});
-  }
-  await browser.storage.local.set({ workspaceOrder: [], activeWorkspace: null });
-  activeByWindow.set(windowId, null);
-  updateBadge(windowId, null);
-  return { success: true };
+  return await withBusy(windowId, async () => {
+    for (const tab of await tabs({ windowId })) {
+      if (!ownable(tab)) continue;
+      await clearTabWorkspaceId(tab.id);
+      if (tab.hidden) await browser.tabs.show(tab.id).catch(() => {});
+    }
+    await saveState(emptyState());
+    activeByWindow.set(windowId, null);
+    await updateBadge(windowId, null);
+    return { success: true };
+  });
 }
 
-// ---- messages ----
-
-browser.runtime.onMessage.addListener(async (m) => {
-  switch (m.action) {
-    case "switch_workspace": await switchWorkspace(m.windowId, m.workspace); return { success: true };
-    case "create_workspace": return await createWorkspace(m.windowId, m.workspace);
-    case "delete_workspace": return await deleteWorkspace(m.windowId, m.workspace);
-    case "rename_workspace": return await renameWorkspace(m.windowId, m.oldName, m.newName);
-    case "reset_all": return await resetAll(m.windowId);
-    case "get_state": {
-      const order = await getOrder();
-      const counts = await getCounts(m.windowId);
-      return { active: activeByWindow.get(m.windowId) || null, order, counts };
-    }
+browser.runtime.onMessage.addListener(async (message) => {
+  switch (message.action) {
+    case "get_state": return await getState(message.windowId);
+    case "create_workspace": return await createWorkspace(message.windowId, message.workspace);
+    case "switch_workspace": return await switchWorkspace(message.windowId, message.workspace);
+    case "delete_workspace": return await deleteWorkspace(message.windowId, message.workspace);
+    case "rename_workspace": return await renameWorkspace(message.windowId, message.oldName, message.newName);
+    case "reset_all": return await resetAll(message.windowId);
     default: return { success: false, reason: "unknown_action" };
   }
 });
 
-// ---- tab events ----
-
-// New tab opened by the user -> label it with the active workspace (unless pinned).
 browser.tabs.onCreated.addListener(async (tab) => {
-  if (busyWindows.has(tab.windowId)) return;       // internal op labels its own tabs
-  if (tab.pinned) return;                           // pinned = global
-  if (await getTabWorkspace(tab.id)) return;        // already labeled
-  const ws = activeByWindow.get(tab.windowId);
-  if (ws) await setTabWorkspace(tab.id, ws);
+  if (!tab || tab.windowId === undefined || tab.pinned || busyWindows.has(tab.windowId)) return;
+  if (await getTabWorkspaceId(tab.id)) return;
+  const id = await activeForWindow(tab.windowId);
+  if (id) await setTabWorkspaceId(tab.id, id);
 });
 
-// Pin/unpin transitions.
 browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.pinned === undefined) return;
-  if (changeInfo.pinned) {
-    await clearTabWorkspace(tabId);                 // became global
-  } else {
-    const ws = tab && activeByWindow.get(tab.windowId);
-    if (ws) await setTabWorkspace(tabId, ws);       // joins active workspace
+  if (!changeInfo || changeInfo.pinned === undefined) return;
+  if (changeInfo.pinned) await clearTabWorkspaceId(tabId);
+  else if (tab && tab.windowId !== undefined) {
+    const id = await activeForWindow(tab.windowId);
+    if (id) await setTabWorkspaceId(tabId, id);
   }
 }, { properties: ["pinned"] });
 
-browser.windows.onRemoved.addListener((windowId) => activeByWindow.delete(windowId));
-
-// ---- bootstrap (startup + install) ----
-// We DO NOT recreate tabs. Firefox already restored them with their labels
-// intact (sessions API). We just read labels and hide everything except the
-// last-active workspace.
+browser.windows.onRemoved.addListener((windowId) => {
+  activeByWindow.delete(windowId);
+  busyWindows.delete(windowId);
+});
 
 async function bootstrap() {
   activeByWindow.clear();
-
-  let win;
-  try { win = await browser.windows.getLastFocused({ windowTypes: ["normal"] }); }
-  catch (e) { return; }
-  const windowId = win.id;
-
-  const order = await getOrder();
-  if (order.length === 0) {
-    activeByWindow.set(windowId, null);
-    updateBadge(windowId, null);
-    return;
+  const id = await activeId();
+  for (const win of await normalWindows()) {
+    activeByWindow.set(win.id, id);
+    await updateBadge(win.id, id);
+    if (id) {
+      await showWorkspace(win.id, id);
+      await ensureWorkspaceTab(win.id, id);
+      await activateWorkspaceTab(win.id, id);
+      await hideOtherKnownTabs(win.id, id);
+    }
   }
-
-  const lastActive = await getActiveWorkspace();
-  const target = (lastActive && order.includes(lastActive)) ? lastActive : order[0];
-
-  // Any restored tab with no label and not pinned: it's an orphan from before
-  // the extension existed, or a fresh session tab — assign it to target so it
-  // isn't stranded invisible.
-  let tabs;
-  try { tabs = await browser.tabs.query({ windowId }); } catch (e) { tabs = []; }
-  for (const t of tabs) {
-    if (t.pinned) continue;
-    const ws = await getTabWorkspace(t.id);
-    if (!ws) await setTabWorkspace(t.id, target);
-  }
-
-  await ensureTab(windowId, target, true);
-  await showWorkspace(windowId, target);
-
-  // Hide every other workspace's tabs.
-  for (const name of order) {
-    if (name === target) continue;
-    await hideWorkspace(windowId, name);
-  }
-
-  activeByWindow.set(windowId, target);
-  updateBadge(windowId, target);
-  await setActiveWorkspace(target);
-  await reconcile(windowId, target);
 }
 
 browser.runtime.onStartup.addListener(bootstrap);
