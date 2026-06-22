@@ -1,51 +1,53 @@
 # Workflow01
 
-Single-window workspace manager for Firefox. Organize live tabs into named workspaces and switch between them without closing, recreating, or intentionally reloading tabs.
+Single-window workspace manager for Firefox. Save, switch, restore, and organize tabs into named workspaces.
 
-## Interface
+## AMO validation fix in 5.3.3
 
-- Native-looking Firefox popup using system colors instead of custom gradients.
-- Simple current-workspace text block with smaller text and no banner color/image.
-- Larger workspace rows for easier clicking.
-- Click `+` to reveal the create-workspace form.
-- Press `Enter` in the create form to create a workspace.
-- Press `Escape` in the create form to hide it.
-- Use arrow keys to highlight workspaces and `Enter` to switch.
+This version uses the existing AMO add-on ID:
+
+```json
+"id": "workflow01@remakr1.com"
+```
+
+The previous package used the wrong ID and AMO rejected it with an ID mismatch.
+
+## AMO manifest metadata
+
+```json
+"browser_specific_settings": {
+  "gecko": {
+    "id": "workflow01@remakr1.com",
+    "strict_min_version": "140.0",
+    "data_collection_permissions": {
+      "required": ["none"]
+    }
+  },
+  "gecko_android": {
+    "strict_min_version": "142.0"
+  }
+}
+```
 
 ## Behavior
 
-- First workspace adopts currently visible non-pinned tabs.
-- Later workspaces open one blank tab and do not steal tabs from the current workspace.
-- Switching workspaces only hides and shows tabs.
-- Workflow01 does not close, recreate, intentionally reload, or discard tabs.
-- Pinned tabs are global because Firefox does not allow extensions to hide pinned tabs.
+- Restores the last active workspace on Firefox startup.
+- Does not intentionally create a second Firefox window.
+- Ignores private windows using `incognito: not_allowed`.
+- Uses transaction locking during switch/create/delete/restore.
+- Creates a safe replacement tab before removing visible tabs.
+- Creating a new workspace does not move the current tab out of the previous workspace.
+- New workspaces are logically empty but visually show a new tab.
+- Deleting the active workspace switches to the previous workspace.
+- Pinned tabs are workspace-specific.
+- Failed privileged URL restore falls back to `about:blank`.
 
 ## Permissions
 
-| Permission | Why it is needed |
-|---|---|
-| `tabs` | Read and manage browser tabs for workspace assignment and switching. |
-| `tabHide` | Hide and show workspace tabs without closing or recreating tabs. |
-| `storage` | Store workspace metadata and active workspace locally. |
-| `sessions` | Store each tab's workspace ID on the tab so ownership can survive Firefox session restore. |
+- `tabs`: read and manage tab URLs, tab titles, pinned state, muted state, and active tab order for workspace save/restore.
+- `storage`: persist workspace data locally in Firefox extension storage.
 
-Workflow01 does not transmit user data outside Firefox.
-
-## Local testing
-
-1. Open Firefox.
-2. Go to `about:debugging#/runtime/this-firefox`.
-3. Click **Load Temporary Add-on…**.
-4. Select `manifest.json` from the project folder.
-5. If Firefox asks to allow hidden tabs, choose **Allow**.
-
-## Version 5.2 changes
-
-- Replaced the custom blue current-workspace banner with a simple native-style text block.
-- Removed decorative image/gradient treatment from the current workspace area.
-- Increased workspace row size for easier clicking.
-- Kept the `+` create-workspace flow.
-- Kept v5 workspace behavior: no tab stealing, no close/recreate switching, stable workspace IDs.
+No host permissions, no content scripts, no remote code, no analytics, no telemetry.
 
 ## License
 

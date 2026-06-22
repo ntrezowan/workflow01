@@ -1,60 +1,50 @@
 {
   "manifest_version": 3,
   "name": "Workflow01",
-  "version": "5.2",
-  "description": "Single-window workspace manager for Firefox. Switch between named workspaces without closing, recreating, or reloading tabs.",
-  "permissions": [
-    "tabs",
-    "tabHide",
-    "storage",
-    "sessions"
-  ],
-  "commands": {
-    "_execute_action": {
-      "suggested_key": {
-        "default": "Ctrl+Shift+Y",
-        "mac": "Command+Shift+Y"
-      },
-      "description": "Open Workflow01 popup"
-    }
-  },
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "workflow01@remakr1.com",
-      "data_collection_permissions": {
-        "required": [
-          "none"
-        ]
-      }
-    }
-  },
+  "version": "5.3.3",
+  "description": "Single-window workspace manager for Firefox. Save, switch, restore, and organize tabs into named workspaces.",
+  "homepage_url": "https://github.com/ntrezowan/workflow01",
   "icons": {
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "Workflow01",
+    "default_popup": "popup.html",
     "default_icon": {
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
-    },
-    "theme_icons": [
-      {
-        "light": "icons/icon-night-48.png",
-        "dark": "icons/icon-day-48.png",
-        "size": 48
-      },
-      {
-        "light": "icons/icon-night-128.png",
-        "dark": "icons/icon-day-128.png",
-        "size": 128
-      }
-    ]
+    }
   },
   "background": {
     "scripts": [
       "background.js"
     ]
+  },
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+  "incognito": "not_allowed",
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y"
+      }
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "workflow01@remakr1.com",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
   }
 }

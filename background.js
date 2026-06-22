@@ -1,360 +1,371 @@
-// Workflow01 — Background Service (v5.2)
-// Firefox owns tab lifetime. Workflow01 owns only workspace labels and visibility.
-// Switching workspaces never closes, recreates, discards, or intentionally reloads tabs.
+/* Workflow01 5.3.2 - transactional single-window Firefox workspace manager. */
+const STORAGE_KEY = "workflow01State";
+const SCHEMA_VERSION = 3;
+const SAFE_URL = "about:blank";
+const NEW_TAB_URL = "about:newtab";
+const AUTOSAVE_DELAY_MS = 800;
+const STARTUP_RESTORE_DELAY_MS = 1500;
+const api = typeof browser !== "undefined" ? browser : chrome;
 
-const TAB_KEY = "workflow01.workspaceId";
-const LEGACY_TAB_KEY = "workspace";
-const SCHEMA_VERSION = 5;
-const activeByWindow = new Map();
-const busyWindows = new Set();
+let transactionDepth = 0;
+let autosaveTimer = null;
+let pendingAutosaveWindowId = null;
+let startupRestoreStarted = false;
 
 const now = () => Date.now();
+const inTx = () => transactionDepth > 0;
 const cleanName = (name) => String(name || "").trim();
-
-function newId() {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") return `ws_${globalThis.crypto.randomUUID()}`;
-  return `ws_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-}
+const nameKey = (name) => cleanName(name).toLowerCase();
+const isBlank = (url) => !url || url === SAFE_URL || url === NEW_TAB_URL;
+const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function emptyState() {
-  return { schemaVersion: SCHEMA_VERSION, workspaces: {}, workspaceOrder: [], activeWorkspaceId: null };
+  return { version: SCHEMA_VERSION, activeWorkspace: null, previousWorkspace: null, workspaceHistory: [], managedWindowId: null, workspaces: {}, lastError: null, updatedAt: now() };
 }
 
-async function saveState(state) {
-  await browser.storage.local.set({
-    schemaVersion: SCHEMA_VERSION,
-    workspaces: state.workspaces,
-    workspaceOrder: state.workspaceOrder,
-    activeWorkspaceId: state.activeWorkspaceId || null,
-  });
-}
-
-async function loadState() {
-  const data = await browser.storage.local.get(null);
-
-  if (data.workspaces && typeof data.workspaces === "object" && Array.isArray(data.workspaceOrder)) {
-    const state = {
-      schemaVersion: SCHEMA_VERSION,
-      workspaces: data.workspaces,
-      workspaceOrder: data.workspaceOrder.filter((id) => data.workspaces[id]),
-      activeWorkspaceId: data.activeWorkspaceId || null,
-    };
-    if (state.activeWorkspaceId && !state.workspaces[state.activeWorkspaceId]) state.activeWorkspaceId = state.workspaceOrder[0] || null;
-    return state;
-  }
-
-  if (Array.isArray(data.workspaceOrder)) {
-    const state = emptyState();
-    const map = {};
-    for (const oldName of data.workspaceOrder) {
-      const name = cleanName(oldName);
-      if (!name || map[name]) continue;
-      const id = newId();
-      map[name] = id;
-      state.workspaces[id] = { id, name, createdAt: now(), updatedAt: now() };
-      state.workspaceOrder.push(id);
-    }
-    const oldActive = cleanName(data.activeWorkspace);
-    state.activeWorkspaceId = oldActive && map[oldActive] ? map[oldActive] : (state.workspaceOrder[0] || null);
-    await saveState(state);
-    await browser.storage.local.set({ legacyWorkspaceNameToId: map });
-    return state;
-  }
-
-  const state = emptyState();
-  await saveState(state);
-  return state;
-}
-
-async function workspaceIdByName(name) {
-  const state = await loadState();
-  const target = cleanName(name);
-  for (const id of state.workspaceOrder) if (state.workspaces[id]?.name === target) return id;
-  return null;
-}
-
-async function getTabWorkspaceId(tabId) {
-  try {
-    const id = await browser.sessions.getTabValue(tabId, TAB_KEY);
-    if (id) return id;
-  } catch (_) {}
-
-  try {
-    const legacyName = await browser.sessions.getTabValue(tabId, LEGACY_TAB_KEY);
-    if (!legacyName) return null;
-    const id = await workspaceIdByName(legacyName);
-    if (id) {
-      await setTabWorkspaceId(tabId, id);
-      return id;
-    }
-  } catch (_) {}
-
-  return null;
-}
-
-async function setTabWorkspaceId(tabId, workspaceId) {
-  try { await browser.sessions.setTabValue(tabId, TAB_KEY, workspaceId); } catch (_) {}
-}
-
-async function clearTabWorkspaceId(tabId) {
-  try { await browser.sessions.removeTabValue(tabId, TAB_KEY); } catch (_) {}
-  try { await browser.sessions.removeTabValue(tabId, LEGACY_TAB_KEY); } catch (_) {}
-}
-
-async function tabs(query) { try { return await browser.tabs.query(query); } catch (_) { return []; } }
-async function normalWindows() { try { return await browser.windows.getAll({ windowTypes: ["normal"] }); } catch (_) { return []; } }
-function ownable(tab) { return tab && tab.id !== undefined && !tab.pinned; }
-
-async function activeId() { return (await loadState()).activeWorkspaceId || null; }
-async function setActiveId(id) {
-  const state = await loadState();
-  state.activeWorkspaceId = id && state.workspaces[id] ? id : null;
-  await saveState(state);
-  return state.activeWorkspaceId;
-}
-
-async function updateBadge(windowId, id) {
-  const state = await loadState();
-  const ws = id ? state.workspaces[id] : null;
-  if (!ws) { await browser.action.setBadgeText({ text: "", windowId }).catch(() => {}); return; }
-  await browser.action.setBadgeText({ text: ws.name.slice(0,3).toUpperCase(), windowId }).catch(() => {});
-  await browser.action.setBadgeBackgroundColor({ color: "#0060df", windowId }).catch(() => {});
-  if (browser.action.setBadgeTextColor) await browser.action.setBadgeTextColor({ color: "#ffffff", windowId }).catch(() => {});
-}
-
-async function activeForWindow(windowId) {
-  if (activeByWindow.has(windowId)) return activeByWindow.get(windowId) || null;
-  const id = await activeId();
-  activeByWindow.set(windowId, id);
-  await updateBadge(windowId, id);
-  return id;
-}
-
-async function setActiveForWindow(windowId, id) {
-  const active = await setActiveId(id);
-  activeByWindow.set(windowId, active);
-  await updateBadge(windowId, active);
-  return active;
-}
-
-async function withBusy(windowId, fn) {
-  if (busyWindows.has(windowId)) return { success: false, reason: "busy" };
-  busyWindows.add(windowId);
-  try { return await fn(); } finally { busyWindows.delete(windowId); }
-}
-
-async function tabsForWorkspace(windowId, id) {
-  const out = [];
-  for (const tab of await tabs({ windowId })) if (ownable(tab) && (await getTabWorkspaceId(tab.id)) === id) out.push(tab);
-  return out;
-}
-
-async function showWorkspace(windowId, id) {
-  const owned = await tabsForWorkspace(windowId, id);
-  const ids = owned.map((tab) => tab.id);
-  if (ids.length) await browser.tabs.show(ids).catch(() => {});
-  return owned;
-}
-
-async function ensureWorkspaceTab(windowId, id) {
-  const owned = await tabsForWorkspace(windowId, id);
-  if (owned.length) return owned[0].id;
-  await setActiveForWindow(windowId, id);
-  const tab = await browser.tabs.create({ windowId, active: true });
-  await setTabWorkspaceId(tab.id, id);
-  return tab.id;
-}
-
-async function activateWorkspaceTab(windowId, id) {
-  const owned = await tabsForWorkspace(windowId, id);
-  const tab = owned.find((candidate) => !candidate.hidden) || owned[0];
+function normalizeTab(tab, index = 0) {
   if (!tab) return null;
-  await browser.tabs.show(tab.id).catch(() => {});
-  await browser.tabs.update(tab.id, { active: true }).catch(() => {});
-  return tab.id;
+  return { url: String(tab.url || tab.pendingUrl || SAFE_URL), title: tab.title || "", pinned: Boolean(tab.pinned), muted: Boolean((tab.mutedInfo && tab.mutedInfo.muted) || tab.muted), active: Boolean(tab.active), index: Number.isInteger(tab.index) ? tab.index : index, failedRestore: Boolean(tab.failedRestore) };
 }
 
-async function hideOtherKnownTabs(windowId, activeWorkspaceId) {
-  const state = await loadState();
-  const known = new Set(state.workspaceOrder);
-  const toHide = [];
-  for (const tab of await tabs({ windowId })) {
-    if (!ownable(tab) || tab.hidden) continue;
-    const owner = await getTabWorkspaceId(tab.id);
-    if (owner && owner !== activeWorkspaceId && known.has(owner)) toHide.push(tab.id);
+function normalizeTabs(tabs) {
+  const list = (tabs || []).map((tab, index) => normalizeTab(tab, index)).filter(Boolean);
+  if (list.length && list.every((tab) => isBlank(tab.url))) return [];
+  return list.map((tab, index) => Object.assign({}, tab, { index }));
+}
+
+function normalizeWorkspace(name, record) {
+  const tabs = Array.isArray(record) ? record : Array.isArray(record && record.tabs) ? record.tabs : [];
+  const normalized = normalizeTabs(tabs);
+  const rawActive = Number.isInteger(record && record.activeTabIndex) ? record.activeTabIndex : tabs.findIndex((tab) => tab && tab.active);
+  return { name, tabs: normalized, activeTabIndex: normalized.length ? Math.max(0, Math.min(rawActive < 0 ? 0 : rawActive, normalized.length - 1)) : 0, updatedAt: record && record.updatedAt ? record.updatedAt : now() };
+}
+
+function normalizeState(state) {
+  const merged = Object.assign(emptyState(), state || {});
+  merged.version = SCHEMA_VERSION;
+  merged.workspaces = merged.workspaces && typeof merged.workspaces === "object" ? merged.workspaces : {};
+  const normalized = {};
+  for (const [key, record] of Object.entries(merged.workspaces)) {
+    const wsName = cleanName(record && record.name ? record.name : key);
+    if (!wsName || normalized[wsName]) continue;
+    normalized[wsName] = normalizeWorkspace(wsName, record);
   }
-  if (toHide.length) await browser.tabs.hide(toHide).catch(() => {});
+  merged.workspaces = normalized;
+  if (merged.activeWorkspace && !merged.workspaces[merged.activeWorkspace]) merged.activeWorkspace = null;
+  if (merged.previousWorkspace && !merged.workspaces[merged.previousWorkspace]) merged.previousWorkspace = null;
+  if (!Array.isArray(merged.workspaceHistory)) merged.workspaceHistory = [];
+  merged.workspaceHistory = merged.workspaceHistory.filter((name) => merged.workspaces[name]);
+  return merged;
 }
 
-async function createWorkspace(windowId, name) {
-  return await withBusy(windowId, async () => {
-    const workspaceName = cleanName(name);
-    if (!workspaceName) return { success: false, reason: "empty" };
-    const state = await loadState();
-    for (const id of state.workspaceOrder) if (state.workspaces[id]?.name === workspaceName) return { success: false, reason: "exists" };
+async function getState() {
+  const data = await api.storage.local.get(null);
+  let state = data[STORAGE_KEY];
+  if (!state) {
+    state = emptyState();
+    if (data.workspaces && typeof data.workspaces === "object") {
+      for (const [name, record] of Object.entries(data.workspaces)) {
+        const wsName = cleanName(name);
+        if (wsName) state.workspaces[wsName] = normalizeWorkspace(wsName, record);
+      }
+    }
+    if (typeof data.activeWorkspace === "string" && state.workspaces[data.activeWorkspace]) state.activeWorkspace = data.activeWorkspace;
+    await setState(state);
+  }
+  return normalizeState(state);
+}
 
-    const id = newId();
-    const isFirst = state.workspaceOrder.length === 0;
-    state.workspaces[id] = { id, name: workspaceName, createdAt: now(), updatedAt: now() };
-    state.workspaceOrder.push(id);
-    state.activeWorkspaceId = id;
-    await saveState(state);
-    await setActiveForWindow(windowId, id);
+async function setState(state) { await api.storage.local.set({ [STORAGE_KEY]: normalizeState(state) }); }
+async function setError(message) { const state = await getState(); state.lastError = message ? { message: String(message), at: now() } : null; await setState(state); }
 
-    if (isFirst) {
-      const visible = (await tabs({ windowId })).filter((tab) => ownable(tab) && !tab.hidden);
-      if (visible.length) for (const tab of visible) await setTabWorkspaceId(tab.id, id);
-      else await ensureWorkspaceTab(windowId, id);
+async function withTransaction(label, fn) {
+  transactionDepth++;
+  try {
+    const before = await getState();
+    before.transaction = { label, startedAt: now() };
+    await setState(before);
+    const result = await fn();
+    const after = await getState();
+    delete after.transaction;
+    after.updatedAt = now();
+    await setState(after);
+    return result;
+  } finally {
+    transactionDepth = Math.max(0, transactionDepth - 1);
+  }
+}
+
+async function getWindow(windowId) { if (!windowId) return null; try { return await api.windows.get(windowId, { populate: false }); } catch (_) { return null; } }
+async function usableWindow(windowId) { const win = await getWindow(windowId); return Boolean(win && win.type === "normal" && !win.incognito); }
+
+async function candidateWindow(preferredWindowId = null) {
+  if (preferredWindowId && await usableWindow(preferredWindowId)) return await getWindow(preferredWindowId);
+  const state = await getState();
+  if (state.managedWindowId && await usableWindow(state.managedWindowId)) return await getWindow(state.managedWindowId);
+  try { const focused = await api.windows.getLastFocused({ populate: false, windowTypes: ["normal"] }); if (focused && !focused.incognito) return focused; } catch (_) {}
+  const wins = await api.windows.getAll({ populate: false, windowTypes: ["normal"] });
+  return wins.find((win) => !win.incognito) || null;
+}
+
+async function queryTabs(windowId) { const tabs = await api.tabs.query({ windowId }); return tabs.filter((tab) => !tab.incognito).sort((a, b) => a.index - b.index); }
+
+async function captureWindow(windowId) {
+  const tabs = await queryTabs(windowId);
+  const records = tabs.map((tab, index) => normalizeTab(tab, index)).filter(Boolean);
+  const normalized = normalizeTabs(records);
+  const activeRaw = Math.max(0, records.findIndex((tab) => tab.active));
+  return { tabs: normalized, activeTabIndex: normalized.length ? Math.min(activeRaw, normalized.length - 1) : 0, updatedAt: now() };
+}
+
+async function saveActiveFromWindow(windowId) {
+  if (inTx() || !windowId || !(await usableWindow(windowId))) return;
+  const state = await getState();
+  if (!state.activeWorkspace || !state.workspaces[state.activeWorkspace]) return;
+  state.workspaces[state.activeWorkspace] = Object.assign({}, state.workspaces[state.activeWorkspace], await captureWindow(windowId), { name: state.activeWorkspace });
+  state.managedWindowId = windowId;
+  state.updatedAt = now();
+  await setState(state);
+}
+
+function scheduleAutosave(windowId) {
+  if (inTx()) return;
+  pendingAutosaveWindowId = windowId || pendingAutosaveWindowId;
+  if (autosaveTimer) clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(async () => {
+    autosaveTimer = null;
+    const target = pendingAutosaveWindowId;
+    pendingAutosaveWindowId = null;
+    try { if (target) await saveActiveFromWindow(target); } catch (error) { await setError(`Autosave failed: ${error.message || error}`); }
+  }, AUTOSAVE_DELAY_MS);
+}
+
+async function safeTab(windowId) { return await api.tabs.create({ windowId, url: SAFE_URL, active: true }); }
+
+async function removeTabsExcept(windowId, keepIds = []) {
+  const keep = new Set(keepIds.filter(Boolean));
+  const removeIds = (await queryTabs(windowId)).filter((tab) => !keep.has(tab.id)).map((tab) => tab.id);
+  if (removeIds.length) await api.tabs.remove(removeIds);
+}
+
+function creatableUrl(url) {
+  if (!url) return SAFE_URL;
+  if (url === SAFE_URL || url === NEW_TAB_URL) return url;
+  if (/^(https?|ftp):\/\//i.test(url)) return url;
+  return SAFE_URL;
+}
+
+async function updateTab(tabId, record, active) {
+  const props = { url: creatableUrl(record && record.url), active: Boolean(active), pinned: Boolean(record && record.pinned), muted: Boolean(record && record.muted) };
+  try { return await api.tabs.update(tabId, props); }
+  catch (_) { return await api.tabs.update(tabId, { url: SAFE_URL, active: Boolean(active), pinned: false, muted: false }); }
+}
+
+async function createTab(windowId, record, active, index) {
+  const url = creatableUrl(record && record.url);
+  const props = { windowId, url, active: Boolean(active), pinned: Boolean(record && record.pinned), muted: Boolean(record && record.muted), index };
+  if (!active && !props.pinned && url !== SAFE_URL && url !== NEW_TAB_URL) { props.discarded = true; if (record && record.title) props.title = record.title; }
+  try { return await api.tabs.create(props); }
+  catch (_) { delete props.discarded; delete props.title; props.url = SAFE_URL; props.pinned = false; props.muted = false; return await api.tabs.create(props); }
+}
+
+async function restoreIntoWindow(windowId, workspace, existingSafeTabId = null) {
+  const tabs = Array.isArray(workspace && workspace.tabs) ? workspace.tabs : [];
+  if (!tabs.length) {
+    if (existingSafeTabId) return await api.tabs.update(existingSafeTabId, { url: NEW_TAB_URL, active: true, pinned: false, muted: false });
+    await api.tabs.create({ windowId, url: NEW_TAB_URL, active: true });
+    return;
+  }
+  const desiredActive = Math.max(0, Math.min(workspace.activeTabIndex || 0, tabs.length - 1));
+  const keep = existingSafeTabId || (await safeTab(windowId)).id;
+  await updateTab(keep, tabs[0], desiredActive === 0);
+  for (let i = 1; i < tabs.length; i++) await createTab(windowId, tabs[i], desiredActive === i, i);
+  const all = await queryTabs(windowId);
+  const active = all.find((tab) => tab.index === desiredActive) || all[desiredActive];
+  if (active) await api.tabs.update(active.id, { active: true });
+}
+
+function pushHistory(state, previousName) {
+  if (!previousName || !state.workspaces[previousName]) return;
+  state.workspaceHistory = (state.workspaceHistory || []).filter((name) => name !== previousName && state.workspaces[name]);
+  state.workspaceHistory.unshift(previousName);
+  state.workspaceHistory = state.workspaceHistory.slice(0, 20);
+  state.previousWorkspace = previousName;
+}
+
+function pickPrevious(state, exclude = null) {
+  for (const name of state.workspaceHistory || []) if (name !== exclude && state.workspaces[name]) return name;
+  if (state.previousWorkspace && state.previousWorkspace !== exclude && state.workspaces[state.previousWorkspace]) return state.previousWorkspace;
+  return Object.keys(state.workspaces).find((name) => name !== exclude) || null;
+}
+
+async function postRestoreSave(windowId, workspaceName) {
+  const state = await getState();
+  if (!workspaceName || !state.workspaces[workspaceName]) return;
+  state.workspaces[workspaceName] = Object.assign({}, state.workspaces[workspaceName], await captureWindow(windowId), { name: workspaceName });
+  state.managedWindowId = windowId;
+  state.updatedAt = now();
+  await setState(state);
+}
+
+async function switchWorkspace(name, preferredWindowId = null) {
+  const target = cleanName(name);
+  if (!target) throw new Error("Workspace name is required.");
+  return await withTransaction("switchWorkspace", async () => {
+    const state = await getState();
+    if (!state.workspaces[target]) throw new Error(`Workspace does not exist: ${target}`);
+    const win = await candidateWindow(preferredWindowId);
+    if (!win) throw new Error("No normal Firefox window is available.");
+    if (state.activeWorkspace && state.workspaces[state.activeWorkspace] && state.activeWorkspace !== target) {
+      state.workspaces[state.activeWorkspace] = Object.assign({}, state.workspaces[state.activeWorkspace], await captureWindow(win.id));
+      pushHistory(state, state.activeWorkspace);
+    }
+    const safe = await safeTab(win.id);
+    await removeTabsExcept(win.id, [safe.id]);
+    state.activeWorkspace = target;
+    state.managedWindowId = win.id;
+    await setState(state);
+    await restoreIntoWindow(win.id, state.workspaces[target], safe.id);
+    await postRestoreSave(win.id, target);
+    return await publicState();
+  });
+}
+
+async function createWorkspace(name, preferredWindowId = null) {
+  const wsName = cleanName(name);
+  if (!wsName) throw new Error("Workspace name is required.");
+  return await withTransaction("createWorkspace", async () => {
+    const state = await getState();
+    const dup = Object.keys(state.workspaces).find((name) => nameKey(name) === nameKey(wsName));
+    if (dup) throw new Error(`Workspace already exists: ${dup}`);
+    const win = await candidateWindow(preferredWindowId);
+    if (!win) throw new Error("No normal Firefox window is available.");
+    if (state.activeWorkspace && state.workspaces[state.activeWorkspace]) {
+      state.workspaces[state.activeWorkspace] = Object.assign({}, state.workspaces[state.activeWorkspace], await captureWindow(win.id));
+      pushHistory(state, state.activeWorkspace);
+    }
+    state.workspaces[wsName] = { name: wsName, tabs: [], activeTabIndex: 0, updatedAt: now() };
+    state.activeWorkspace = wsName;
+    state.managedWindowId = win.id;
+    await setState(state);
+    const safe = await safeTab(win.id);
+    await removeTabsExcept(win.id, [safe.id]);
+    await restoreIntoWindow(win.id, state.workspaces[wsName], safe.id);
+    return await publicState();
+  });
+}
+
+async function deleteWorkspace(name, preferredWindowId = null) {
+  const wsName = cleanName(name);
+  if (!wsName) throw new Error("Workspace name is required.");
+  return await withTransaction("deleteWorkspace", async () => {
+    const state = await getState();
+    if (!state.workspaces[wsName]) throw new Error(`Workspace does not exist: ${wsName}`);
+    const wasActive = state.activeWorkspace === wsName;
+    const target = wasActive ? pickPrevious(state, wsName) : state.activeWorkspace;
+    delete state.workspaces[wsName];
+    state.workspaceHistory = (state.workspaceHistory || []).filter((name) => name !== wsName && state.workspaces[name]);
+    if (state.previousWorkspace === wsName) state.previousWorkspace = pickPrevious(state, wsName);
+    const win = await candidateWindow(preferredWindowId);
+    if (!wasActive || !win) { state.activeWorkspace = target || null; await setState(state); return await publicState(); }
+    const safe = await safeTab(win.id);
+    await removeTabsExcept(win.id, [safe.id]);
+    if (target && state.workspaces[target]) {
+      state.activeWorkspace = target;
+      state.managedWindowId = win.id;
+      await setState(state);
+      await restoreIntoWindow(win.id, state.workspaces[target], safe.id);
+      await postRestoreSave(win.id, target);
     } else {
-      const tab = await browser.tabs.create({ windowId, active: true });
-      await setTabWorkspaceId(tab.id, id);
-      await browser.tabs.show(tab.id).catch(() => {});
+      state.activeWorkspace = null;
+      state.previousWorkspace = null;
+      state.managedWindowId = win.id;
+      await setState(state);
+      await api.tabs.update(safe.id, { url: NEW_TAB_URL, active: true, pinned: false, muted: false });
     }
-    await hideOtherKnownTabs(windowId, id);
-    return { success: true };
+    return await publicState();
   });
 }
 
-async function switchWorkspace(windowId, name) {
-  return await withBusy(windowId, async () => {
-    const id = await workspaceIdByName(name);
-    if (!id) return { success: false, reason: "missing" };
-    await setActiveForWindow(windowId, id);
-    await showWorkspace(windowId, id);
-    await ensureWorkspaceTab(windowId, id);
-    await activateWorkspaceTab(windowId, id);
-    await hideOtherKnownTabs(windowId, id);
-    return { success: true };
+async function renameWorkspace(oldName, newName) {
+  const oldClean = cleanName(oldName), newClean = cleanName(newName);
+  if (!oldClean || !newClean) throw new Error("Workspace names are required.");
+  return await withTransaction("renameWorkspace", async () => {
+    const state = await getState();
+    if (!state.workspaces[oldClean]) throw new Error(`Workspace does not exist: ${oldClean}`);
+    const dup = Object.keys(state.workspaces).find((name) => nameKey(name) === nameKey(newClean));
+    if (dup && dup !== oldClean) throw new Error(`Workspace already exists: ${dup}`);
+    state.workspaces[newClean] = Object.assign({}, state.workspaces[oldClean], { name: newClean, updatedAt: now() });
+    if (newClean !== oldClean) delete state.workspaces[oldClean];
+    if (state.activeWorkspace === oldClean) state.activeWorkspace = newClean;
+    if (state.previousWorkspace === oldClean) state.previousWorkspace = newClean;
+    state.workspaceHistory = (state.workspaceHistory || []).map((name) => name === oldClean ? newClean : name);
+    await setState(state);
+    return await publicState();
   });
 }
 
-async function deleteWorkspace(windowId, name) {
-  return await withBusy(windowId, async () => {
-    const id = await workspaceIdByName(name);
-    if (!id) return { success: false, reason: "missing" };
-    const state = await loadState();
-    const ownedTabs = await tabsForWorkspace(windowId, id);
-    const tabIds = ownedTabs.map((tab) => tab.id);
-
-    delete state.workspaces[id];
-    state.workspaceOrder = state.workspaceOrder.filter((candidate) => candidate !== id);
-    if (state.activeWorkspaceId === id) state.activeWorkspaceId = state.workspaceOrder[0] || null;
-    await saveState(state);
-    await setActiveForWindow(windowId, state.activeWorkspaceId);
-
-    if (state.activeWorkspaceId) {
-      await showWorkspace(windowId, state.activeWorkspaceId);
-      await ensureWorkspaceTab(windowId, state.activeWorkspaceId);
-      await activateWorkspaceTab(windowId, state.activeWorkspaceId);
+async function importWorkspaces(payload) {
+  return await withTransaction("importWorkspaces", async () => {
+    const state = await getState();
+    const source = payload && payload.workspaces ? payload.workspaces : payload;
+    if (!source || typeof source !== "object") throw new Error("Import file does not contain workspaces.");
+    for (const [name, record] of Object.entries(source)) {
+      const wsName = cleanName(record && record.name ? record.name : name);
+      if (wsName) state.workspaces[wsName] = normalizeWorkspace(wsName, record);
     }
-
-    for (const tabId of tabIds) await clearTabWorkspaceId(tabId);
-    if (tabIds.length) await browser.tabs.remove(tabIds).catch(() => {});
-    if (state.activeWorkspaceId) await hideOtherKnownTabs(windowId, state.activeWorkspaceId);
-    return { success: true };
+    await setState(state);
+    return await publicState();
   });
 }
 
-async function renameWorkspace(windowId, oldName, newName) {
-  return await withBusy(windowId, async () => {
-    const id = await workspaceIdByName(oldName);
-    const name = cleanName(newName);
-    if (!id || !name) return { success: false, reason: "invalid" };
-    const state = await loadState();
-    for (const other of state.workspaceOrder) if (other !== id && state.workspaces[other]?.name === name) return { success: false, reason: "exists" };
-    state.workspaces[id].name = name;
-    state.workspaces[id].updatedAt = now();
-    await saveState(state);
-    if ((await activeForWindow(windowId)) === id) await updateBadge(windowId, id);
-    return { success: true };
-  });
+async function publicState() {
+  const state = await getState();
+  const names = Object.keys(state.workspaces).sort((a, b) => a.localeCompare(b));
+  return { version: state.version, activeWorkspace: state.activeWorkspace, previousWorkspace: state.previousWorkspace, workspaces: clone(state.workspaces), names, lastError: state.lastError };
 }
 
-async function countsByName(windowId) {
-  const state = await loadState();
-  const counts = {};
-  for (const id of state.workspaceOrder) counts[id] = 0;
-  for (const tab of await tabs({ windowId })) {
-    if (!ownable(tab)) continue;
-    const owner = await getTabWorkspaceId(tab.id);
-    if (owner && Object.prototype.hasOwnProperty.call(counts, owner)) counts[owner]++;
-  }
-  const out = {};
-  for (const id of state.workspaceOrder) if (state.workspaces[id]) out[state.workspaces[id].name] = counts[id] || 0;
-  return out;
+async function restoreLastActive() {
+  if (startupRestoreStarted) return;
+  startupRestoreStarted = true;
+  setTimeout(async () => {
+    try {
+      const state = await getState();
+      if (!state.activeWorkspace || !state.workspaces[state.activeWorkspace]) return;
+      const win = await candidateWindow(state.managedWindowId);
+      if (win && !win.incognito) await switchWorkspace(state.activeWorkspace, win.id);
+    } catch (error) { await setError(`Startup restore failed: ${error.message || error}`); }
+    finally { startupRestoreStarted = false; }
+  }, STARTUP_RESTORE_DELAY_MS);
 }
 
-async function getState(windowId) {
-  const state = await loadState();
-  const id = await activeForWindow(windowId);
-  return {
-    active: id && state.workspaces[id] ? state.workspaces[id].name : null,
-    order: state.workspaceOrder.map((workspaceId) => state.workspaces[workspaceId]).filter(Boolean).map((workspace) => workspace.name),
-    counts: await countsByName(windowId),
+api.runtime.onInstalled.addListener(async () => { try { await setState(await getState()); } catch (error) { await setError(`Install initialization failed: ${error.message || error}`); } });
+api.runtime.onStartup.addListener(() => restoreLastActive());
+api.tabs.onCreated.addListener((tab) => { if (!inTx() && tab && tab.windowId) scheduleAutosave(tab.windowId); });
+api.tabs.onRemoved.addListener((tabId, info) => { if (!inTx() && info && info.windowId) scheduleAutosave(info.windowId); });
+api.tabs.onActivated.addListener((info) => { if (!inTx() && info && info.windowId) scheduleAutosave(info.windowId); });
+api.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (inTx()) return;
+  if (!changeInfo.url && changeInfo.status !== "complete" && changeInfo.pinned === undefined && changeInfo.mutedInfo === undefined) return;
+  if (tab && tab.windowId) scheduleAutosave(tab.windowId);
+});
+
+api.runtime.onMessage.addListener((message) => {
+  const run = async () => {
+    const action = message && message.action;
+    const windowId = message && message.windowId;
+    if (action === "getState") return await publicState();
+    if (action === "createWorkspace") return await createWorkspace(message.name, windowId);
+    if (action === "switchWorkspace") return await switchWorkspace(message.name, windowId);
+    if (action === "deleteWorkspace") return await deleteWorkspace(message.name, windowId);
+    if (action === "renameWorkspace") return await renameWorkspace(message.oldName, message.newName);
+    if (action === "exportWorkspaces") return await getState();
+    if (action === "importWorkspaces") return await importWorkspaces(message.data);
+    if (action === "saveNow") { if (windowId) await saveActiveFromWindow(windowId); return await publicState(); }
+    throw new Error(`Unknown action: ${action}`);
   };
-}
-
-async function resetAll(windowId) {
-  return await withBusy(windowId, async () => {
-    for (const tab of await tabs({ windowId })) {
-      if (!ownable(tab)) continue;
-      await clearTabWorkspaceId(tab.id);
-      if (tab.hidden) await browser.tabs.show(tab.id).catch(() => {});
-    }
-    await saveState(emptyState());
-    activeByWindow.set(windowId, null);
-    await updateBadge(windowId, null);
-    return { success: true };
+  return run().catch(async (error) => {
+    await setError(error.message || String(error));
+    return { error: error.message || String(error), state: await publicState() };
   });
-}
-
-browser.runtime.onMessage.addListener(async (message) => {
-  switch (message.action) {
-    case "get_state": return await getState(message.windowId);
-    case "create_workspace": return await createWorkspace(message.windowId, message.workspace);
-    case "switch_workspace": return await switchWorkspace(message.windowId, message.workspace);
-    case "delete_workspace": return await deleteWorkspace(message.windowId, message.workspace);
-    case "rename_workspace": return await renameWorkspace(message.windowId, message.oldName, message.newName);
-    case "reset_all": return await resetAll(message.windowId);
-    default: return { success: false, reason: "unknown_action" };
-  }
 });
-
-browser.tabs.onCreated.addListener(async (tab) => {
-  if (!tab || tab.windowId === undefined || tab.pinned || busyWindows.has(tab.windowId)) return;
-  if (await getTabWorkspaceId(tab.id)) return;
-  const id = await activeForWindow(tab.windowId);
-  if (id) await setTabWorkspaceId(tab.id, id);
-});
-
-browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (!changeInfo || changeInfo.pinned === undefined) return;
-  if (changeInfo.pinned) await clearTabWorkspaceId(tabId);
-  else if (tab && tab.windowId !== undefined) {
-    const id = await activeForWindow(tab.windowId);
-    if (id) await setTabWorkspaceId(tabId, id);
-  }
-}, { properties: ["pinned"] });
-
-browser.windows.onRemoved.addListener((windowId) => {
-  activeByWindow.delete(windowId);
-  busyWindows.delete(windowId);
-});
-
-async function bootstrap() {
-  activeByWindow.clear();
-  const id = await activeId();
-  for (const win of await normalWindows()) {
-    activeByWindow.set(win.id, id);
-    await updateBadge(win.id, id);
-    if (id) {
-      await showWorkspace(win.id, id);
-      await ensureWorkspaceTab(win.id, id);
-      await activateWorkspaceTab(win.id, id);
-      await hideOtherKnownTabs(win.id, id);
-    }
-  }
-}
-
-browser.runtime.onStartup.addListener(bootstrap);
-browser.runtime.onInstalled.addListener(bootstrap);
