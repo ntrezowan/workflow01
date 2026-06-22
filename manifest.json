@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Workflow01",
-  "version": "5.2",
+  "version": "5.3.4",
   "description": "Single-window workspace manager for Firefox. Switch between named workspaces without closing, recreating, or reloading tabs.",
   "permissions": [
     "tabs",
@@ -21,11 +21,15 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "workflow01@remakr1.com",
+      "strict_min_version": "140.0",
       "data_collection_permissions": {
         "required": [
           "none"
         ]
       }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
     }
   },
   "icons": {
@@ -56,5 +60,6 @@
     "scripts": [
       "background.js"
     ]
-  }
+  },
+  "incognito": "not_allowed"
 }
