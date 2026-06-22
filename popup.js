@@ -1,1 +1,263 @@
-const api=typeof browser!=="undefined"?browser:chrome;const els={activeLabel:document.getElementById("activeLabel"),workspaceName:document.getElementById("workspaceName"),createWorkspace:document.getElementById("createWorkspace"),workspaceList:document.getElementById("workspaceList"),exportBtn:document.getElementById("exportBtn"),importBtn:document.getElementById("importBtn"),importFile:document.getElementById("importFile"),saveNow:document.getElementById("saveNow"),status:document.getElementById("status")};let currentWindowId=null,currentState=null;function setStatus(m,e=false){els.status.textContent=m||"";els.status.classList.toggle("error",!!e)}async function initWindowId(){const w=await api.windows.getCurrent({populate:false});currentWindowId=w.id;if(w.incognito)setStatus("Workflow01 is disabled in private windows.",true)}async function send(action,payload={}){const r=await api.runtime.sendMessage(Object.assign({},payload,{action,windowId:currentWindowId}));if(r&&r.error)throw new Error(r.error);return r}function tabCount(w){return w&&Array.isArray(w.tabs)?w.tabs.length:0}function render(state){currentState=state;const active=state.activeWorkspace;els.activeLabel.textContent=active?`Active: ${active}`:"No active workspace";els.workspaceList.textContent="";if(!state.names||!state.names.length){const empty=document.createElement("div");empty.className="subtle";empty.textContent="No workspaces yet. Create one to start.";els.workspaceList.appendChild(empty);return}for(const name of state.names){const workspace=state.workspaces[name];const row=document.createElement("div");row.className=`workspace${name===active?" active":""}`;const main=document.createElement("button");main.style.textAlign="left";main.title=`Switch to ${name}`;main.innerHTML='<div class="workspaceName"></div><div class="count"></div>';main.querySelector(".workspaceName").textContent=name;main.querySelector(".count").textContent=`${tabCount(workspace)} tab${tabCount(workspace)===1?"":"s"}`;main.addEventListener("click",async()=>{try{setStatus(`Switching to ${name}…`);render(await send("switchWorkspace",{name}));setStatus(`Switched to ${name}.`)}catch(e){setStatus(e.message,true)}});const rename=document.createElement("button");rename.className="icon";rename.title="Rename workspace";rename.textContent="✎";rename.addEventListener("click",async()=>{const newName=prompt("New workspace name",name);if(!newName||newName.trim()===name)return;try{render(await send("renameWorkspace",{oldName:name,newName}));setStatus(`Renamed ${name} to ${newName.trim()}.`)}catch(e){setStatus(e.message,true)}});const del=document.createElement("button");del.className="icon danger";del.title="Delete workspace";del.textContent="×";del.addEventListener("click",async()=>{const msg=name===active?`Delete active workspace "${name}"? Workflow01 will switch to the previous workspace.`:`Delete workspace "${name}"?`;if(!confirm(msg))return;try{setStatus(`Deleting ${name}…`);render(await send("deleteWorkspace",{name}));setStatus(`Deleted ${name}.`)}catch(e){setStatus(e.message,true)}});row.append(main,rename,del);els.workspaceList.appendChild(row)}}async function refresh(){try{render(await send("getState"));if(currentState&&currentState.lastError)setStatus(currentState.lastError.message,true)}catch(e){setStatus(e.message,true)}}els.createWorkspace.addEventListener("click",async()=>{const name=els.workspaceName.value.trim();if(!name)return setStatus("Enter a workspace name.",true);try{setStatus(`Creating ${name}…`);render(await send("createWorkspace",{name}));els.workspaceName.value="";setStatus(`Created ${name}.`)}catch(e){setStatus(e.message,true)}});els.workspaceName.addEventListener("keydown",e=>{if(e.key==="Enter")els.createWorkspace.click()});els.saveNow.addEventListener("click",async()=>{try{render(await send("saveNow"));setStatus("Saved current workspace.")}catch(e){setStatus(e.message,true)}});els.exportBtn.addEventListener("click",async()=>{try{const data=await send("exportWorkspaces");const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download=`workflow01-export-${new Date().toISOString().replace(/[:.]/g,"-")}.json`;a.click();URL.revokeObjectURL(url);setStatus("Exported workspaces.")}catch(e){setStatus(e.message,true)}});els.importBtn.addEventListener("click",()=>els.importFile.click());els.importFile.addEventListener("change",async()=>{const file=els.importFile.files&&els.importFile.files[0];if(!file)return;try{render(await send("importWorkspaces",{data:JSON.parse(await file.text())}));setStatus("Imported workspaces.")}catch(e){setStatus(`Import failed: ${e.message}`,true)}finally{els.importFile.value=""}});initWindowId().then(refresh).catch(e=>setStatus(e.message,true));
+// Workflow01 — Popup UI (v5.2)
+document.addEventListener("DOMContentLoaded", async () => {
+  const listContainer = document.getElementById("workspace-list");
+  const nameInput = document.getElementById("workspace-name");
+  const currentNameEl = document.getElementById("current-name");
+  const inputHint = document.getElementById("input-hint");
+  const addButton = document.getElementById("add-workspace");
+  const createPanel = document.getElementById("create-panel");
+  const createGo = document.getElementById("create-go");
+  const confirmOverlay = document.getElementById("confirm-overlay");
+  const confirmMessage = document.getElementById("confirm-message");
+  const confirmCancel = document.getElementById("confirm-cancel");
+  const confirmOk = document.getElementById("confirm-ok");
+  const resetLink = document.getElementById("reset-link");
+
+  const currentWindow = await browser.windows.getCurrent();
+  const windowId = currentWindow.id;
+  let currentWorkspace = null;
+  let order = [];
+  let counts = {};
+  let highlightIndex = -1;
+
+  function setBanner() {
+    currentNameEl.textContent = currentWorkspace || "None";
+    currentNameEl.title = currentWorkspace || "None";
+  }
+
+  function setCreateOpen(open) {
+    createPanel.classList.toggle("visible", open);
+    addButton.classList.toggle("open", open);
+    if (open) {
+      nameInput.value = "";
+      clearHint();
+      setTimeout(() => nameInput.focus(), 0);
+    }
+  }
+
+  function clearHint() {
+    inputHint.textContent = "Press Enter to create";
+    inputHint.classList.remove("input-error");
+  }
+
+  function setError(message) {
+    inputHint.textContent = message;
+    inputHint.classList.add("input-error");
+  }
+
+  function setBusy(label) {
+    let el = document.getElementById("wf-busy");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "wf-busy";
+      el.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.25);z-index:300;display:flex;align-items:center;justify-content:center;font:menu;color:CanvasText;";
+      document.body.appendChild(el);
+    }
+    el.textContent = label;
+    el.style.display = "flex";
+  }
+
+  function clearBusy() {
+    const el = document.getElementById("wf-busy");
+    if (el) el.style.display = "none";
+  }
+
+  function validateName(name) {
+    if (!name) return "Name cannot be empty.";
+    if (name.length > 40) return "Name must be 40 characters or fewer.";
+    if (/[\u0000-\u001f\u007f]/.test(name)) return "Name contains invalid characters.";
+    if (!/[\p{L}\p{N}]/u.test(name)) return "Name must contain a letter or number.";
+    return null;
+  }
+
+  function showConfirm(message, okLabel = "Delete") {
+    return new Promise((resolve) => {
+      confirmMessage.textContent = message;
+      confirmOk.textContent = okLabel;
+      confirmOverlay.classList.add("visible");
+
+      function cleanup() {
+        confirmOverlay.classList.remove("visible");
+        confirmCancel.removeEventListener("click", onCancel);
+        confirmOk.removeEventListener("click", onOk);
+      }
+      function onCancel() { cleanup(); resolve(false); }
+      function onOk() { cleanup(); resolve(true); }
+
+      confirmCancel.addEventListener("click", onCancel);
+      confirmOk.addEventListener("click", onOk);
+    });
+  }
+
+  async function refreshState() {
+    const state = await browser.runtime.sendMessage({ action: "get_state", windowId });
+    currentWorkspace = state.active || null;
+    order = state.order || [];
+    counts = state.counts || {};
+    setBanner();
+    return state;
+  }
+
+  async function renderList() {
+    listContainer.innerHTML = "";
+    await refreshState();
+
+    if (!order.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-msg";
+      empty.textContent = "No workspaces yet. Click + to create your first workspace.";
+      listContainer.appendChild(empty);
+      return;
+    }
+
+    order.forEach((name) => {
+      const row = document.createElement("div");
+      row.className = "workspace-row";
+      if (name === currentWorkspace) row.classList.add("active");
+
+      const nameEl = document.createElement("div");
+      nameEl.className = "workspace-name";
+      nameEl.textContent = name;
+      nameEl.title = name;
+      row.appendChild(nameEl);
+
+      const countEl = document.createElement("div");
+      countEl.className = "workspace-count";
+      countEl.textContent = counts[name] || 0;
+      countEl.title = `${counts[name] || 0} tab${(counts[name] || 0) === 1 ? "" : "s"}`;
+      row.appendChild(countEl);
+
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "row-btn rename-btn";
+      renameBtn.textContent = "✎";
+      renameBtn.title = "Rename";
+      renameBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        startRename(row, nameEl, name);
+      });
+      row.appendChild(renameBtn);
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.className = "row-btn delete-btn";
+      deleteBtn.textContent = "×";
+      deleteBtn.title = "Delete";
+      deleteBtn.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        const ok = await showConfirm(`Delete workspace "${name}"? This closes its tabs and cannot be undone.`, "Delete");
+        if (!ok) return;
+        setBusy("Deleting…");
+        const response = await browser.runtime.sendMessage({ action: "delete_workspace", windowId, workspace: name });
+        clearBusy();
+        if (response.success) await renderList();
+      });
+      row.appendChild(deleteBtn);
+
+      row.addEventListener("click", async () => {
+        if (name === currentWorkspace) { window.close(); return; }
+        setBusy("Switching…");
+        const response = await browser.runtime.sendMessage({ action: "switch_workspace", windowId, workspace: name });
+        if (response.success) window.close();
+        else clearBusy();
+      });
+
+      listContainer.appendChild(row);
+    });
+  }
+
+  async function createWorkspaceFromInput() {
+    const name = nameInput.value.trim();
+    const err = validateName(name);
+    if (err) { setError(err); return; }
+    if (order.includes(name)) { setError("A workspace with that name already exists."); return; }
+
+    setBusy("Creating…");
+    const response = await browser.runtime.sendMessage({ action: "create_workspace", windowId, workspace: name });
+    clearBusy();
+
+    if (response.success) window.close();
+    else setError(response.reason === "exists" ? "A workspace with that name already exists." : "Could not create workspace.");
+  }
+
+  function startRename(row, oldNameEl, oldName) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = oldName;
+    input.className = "ws-input";
+    input.style.height = "28px";
+    oldNameEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let committed = false;
+
+    async function commit() {
+      if (committed) return;
+      committed = true;
+      const newName = input.value.trim();
+      if (!newName || newName === oldName) { await renderList(); return; }
+      if (order.includes(newName)) { input.style.borderColor = "Mark"; committed = false; return; }
+      const err = validateName(newName);
+      if (err) { input.style.borderColor = "Mark"; committed = false; return; }
+
+      const response = await browser.runtime.sendMessage({ action: "rename_workspace", windowId, oldName, newName });
+      if (response.success) await renderList();
+      else { input.style.borderColor = "Mark"; committed = false; }
+    }
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { event.preventDefault(); commit(); }
+      else if (event.key === "Escape") { renderList(); }
+    });
+    input.addEventListener("blur", commit);
+  }
+
+  addButton.addEventListener("click", () => setCreateOpen(!createPanel.classList.contains("visible")));
+  createGo.addEventListener("click", createWorkspaceFromInput);
+  nameInput.addEventListener("input", clearHint);
+  nameInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); createWorkspaceFromInput(); }
+    else if (event.key === "Escape") { event.preventDefault(); setCreateOpen(false); }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (document.activeElement === nameInput) return;
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      setCreateOpen(true);
+      return;
+    }
+
+    const rows = [...listContainer.querySelectorAll(".workspace-row")];
+    if (!rows.length) return;
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      highlightIndex = Math.min(highlightIndex + 1, rows.length - 1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      highlightIndex = Math.max(highlightIndex - 1, 0);
+    } else if (event.key === "Enter" && highlightIndex >= 0) {
+      event.preventDefault();
+      rows[highlightIndex].click();
+      return;
+    } else {
+      return;
+    }
+
+    rows.forEach((row, index) => {
+      row.style.outline = index === highlightIndex ? "2px solid AccentColor" : "";
+      row.style.outlineOffset = index === highlightIndex ? "-2px" : "";
+      if (index === highlightIndex) row.scrollIntoView({ block: "nearest" });
+    });
+  });
+
+  resetLink.addEventListener("click", async (event) => {
+    event.preventDefault();
+    const ok = await showConfirm("Reset all workspaces? This clears every workspace and un-hides all tabs. Your tabs are kept. This cannot be undone.", "Reset");
+    if (!ok) return;
+    setBusy("Resetting…");
+    await browser.runtime.sendMessage({ action: "reset_all", windowId });
+    window.close();
+  });
+
+  await renderList();
+});
