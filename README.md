@@ -39,14 +39,6 @@ Workflow01 does not transmit user data outside Firefox.
 4. Select `manifest.json` from the project folder.
 5. If Firefox asks to allow hidden tabs, choose **Allow**.
 
-## Version 5.2 changes
-
-- Replaced the custom blue current-workspace banner with a simple native-style text block.
-- Removed decorative image/gradient treatment from the current workspace area.
-- Increased workspace row size for easier clicking.
-- Kept the `+` create-workspace flow.
-- Kept v5 workspace behavior: no tab stealing, no close/recreate switching, stable workspace IDs.
-
 ## License
 
 MIT
